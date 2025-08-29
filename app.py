@@ -1,249 +1,299 @@
-# app.py — Bitget Futures router (robust TradingView payload parser)
-import os, json, logging, traceback, math, re
-from typing import Optional, Dict, Any, Set
-from fastapi import FastAPI, Request, HTTPException, Header
-import ccxt
+import os, json, time, traceback
+from typing import Any, Dict, Optional
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
-                    format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("bitget-router")
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse, PlainTextResponse
+import uvicorn
 
-BITGET_API_KEY      = os.getenv("BITGET_API_KEY", "")
-BITGET_API_SECRET   = os.getenv("BITGET_API_SECRET", "")
-BITGET_API_PASSWORD = os.getenv("BITGET_API_PASSWORD", "")  # passphrase
-WEBHOOK_SECRET      = os.getenv("WEBHOOK_SECRET") or os.getenv("WEBHOOK_KEY", "")
-MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "10"))
-DRY_RUN             = os.getenv("DRY_RUN", "true").lower() == "true"
+import ccxt  # ccxt==4.x
 
-app = FastAPI(title="tv-bitget-router", version="2.0.0")
+app = FastAPI(title="TV-Bitget Router", version="1.0")
 
-# ---- Bitget USDT-M Perp ----
-exchange = ccxt.bitget({
-    "apiKey": BITGET_API_KEY,
-    "secret": BITGET_API_SECRET,
-    "password": BITGET_API_PASSWORD,
-    "enableRateLimit": True,
-    "options": {"defaultType": "swap"},  # USDT-M perpetual
-})
-try:
-    exchange.load_markets()
-    log.info("Bitget markets loaded (defaultType=swap)")
-except Exception as e:
-    log.error(f"load_markets failed: {e}")
+# ──────────────────────────────────────────────────────────────────────────────
+# 환경변수
+# ──────────────────────────────────────────────────────────────────────────────
+API_KEY     = os.getenv("BITGET_API_KEY", "")
+API_SECRET  = os.getenv("BITGET_API_SECRET", "")
+API_PASS    = os.getenv("BITGET_API_PASSWORD", "")  # Bitget Passphrase
+WEBHOOK_KEY = os.getenv("WEBHOOK_SECRET", "mySecret123!")
 
-def mask(s: Optional[str]) -> str:
-    if not s: return ""
-    return s[:2] + "*"*(len(s)-4) + s[-2:] if len(s)>4 else "*"*len(s)
+# 선물 전용
+DEFAULT_TYPE = "swap"  # Bitget USDT-M Perp
+MAX_OPEN     = int(os.getenv("MAX_OPEN_POSITIONS", "10"))  # 동시에 허용할 심볼 개수
 
-# ---------- payload parsing ----------
-def try_json(text: str) -> Optional[Dict[str, Any]]:
+# 균일 노출(“현재 시드의 1/10 × 레버리지 10배”)
+FORCE_EQUAL  = os.getenv("FORCE_EQUAL_NOTIONAL", "true").lower() == "true"
+FRACTION_PER_POSITION = float(os.getenv("FRACTION_PER_POSITION", "0.10"))  # 1/10
+LEVERAGE     = float(os.getenv("LEVERAGE", "10"))  # 노출 환산용(참고)
+
+# 최소 주문 금액 기본값(심볼별 limits에 없으면 이 값을 사용)
+DEFAULT_MIN_NOTIONAL = float(os.getenv("DEFAULT_MIN_NOTIONAL", "5"))
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ccxt Bitget 인스턴스
+# ──────────────────────────────────────────────────────────────────────────────
+def make_exchange() -> ccxt.bitget:
+    ex = ccxt.bitget({
+        "apiKey": API_KEY,
+        "secret": API_SECRET,
+        "password": API_PASS,
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": DEFAULT_TYPE,    # swap
+        },
+    })
+    ex.load_markets()
+    return ex
+
+exchange = make_exchange()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 유틸: 심볼 변환
+# TradingView 예: "SUIUSDT.P" → Bitget market id "SUIUSDT_UMCBL" → ccxt 심볼 "SUI/USDT:USDT"
+# ──────────────────────────────────────────────────────────────────────────────
+def tv_to_umcbl(tv_symbol: str) -> str:
+    sym = tv_symbol.strip().upper()
+    if sym.endswith(".P"):
+        sym = sym[:-2]
+    # 이미 UMCBL 형태로 들어오면 그대로
+    if sym.endswith("_UMCBL"):
+        return sym
+    return f"{sym}_UMCBL"
+
+def umcbl_to_ccxt(umcbl_symbol: str) -> str:
+    # "BTCUSDT_UMCBL" → "BTC/USDT:USDT"
+    if not umcbl_symbol.endswith("_UMCBL"):
+        raise ValueError(f"unexpected umcbl symbol: {umcbl_symbol}")
+    core = umcbl_symbol[:-6]  # remove "_UMCBL"
+    if core.endswith("USDT"):
+        base = core[:-4]
+        quote = "USDT"
+    else:
+        # fallback
+        base, quote = core, "USDT"
+    return f"{base}/{quote}:USDT"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 유틸: 현재 열린 선물 포지션 수(심볼 개수) 계산
+# ──────────────────────────────────────────────────────────────────────────────
+def count_open_positions(ex: ccxt.bitget) -> int:
     try:
-        return json.loads(text)
+        poss = ex.fetch_positions()
+        cnt = 0
+        seen = set()
+        for p in poss:
+            if p.get("contract", "") and abs(float(p.get("contracts", 0))) > 0:
+                # 심볼 기준 unique
+                seen.add(p.get("symbol"))
+        cnt = len(seen)
+        return cnt
     except Exception:
+        return 0
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 유틸: 균일 노출 수량 계산 (신규 진입시에만)
+#  - 청산/감소 주문(reduceOnly=True)은 None 반환하여 기존 수량 유지
+# ──────────────────────────────────────────────────────────────────────────────
+def compute_uniform_amount(ex: ccxt.bitget, ccxt_symbol: str, reduce_only: bool) -> Optional[float]:
+    if reduce_only or not FORCE_EQUAL:
+        return None
+    try:
+        bal = ex.fetch_balance()
+        eq = None
+        if "USDT" in bal:
+            eq = bal["USDT"].get("total") or bal["USDT"].get("free")
+        if not eq or eq <= 0:
+            return None
+
+        ticker = ex.fetch_ticker(ccxt_symbol)
+        price = ticker.get("last") or ticker.get("close")
+        if not price or price <= 0:
+            return None
+
+        per_pos = eq * max(min(FRACTION_PER_POSITION, 1.0), 0.0)
+        target_notional = per_pos * max(LEVERAGE, 1.0)
+        raw_amount = target_notional / price
+
+        market = ex.market(ccxt_symbol)
+        amt = float(ex.amount_to_precision(ccxt_symbol, raw_amount))
+
+        # 최소 주문 금액 보정
+        min_cost = float(market.get("limits", {}).get("cost", {}).get("min", DEFAULT_MIN_NOTIONAL))
+        if (amt * price) < min_cost:
+            amt = float(ex.amount_to_precision(ccxt_symbol, min_cost / price))
+
+        return max(amt, 0.0)
+    except Exception as e:
+        print(f"[uniform] skip (reason={e})")
         return None
 
-def extract_first_json(text: str) -> Optional[Dict[str, Any]]:
-    # 찾아서 처음 나오는 {...} 를 파싱
-    m = re.search(r"\{.*\}", text, flags=re.S)
-    if not m: return None
-    return try_json(m.group(0))
-
-def kv_to_dict(text: str) -> Optional[Dict[str, Any]]:
-    # key=value 줄들 → dict
-    lines = [l.strip() for l in text.splitlines() if "=" in l]
-    if not lines: return None
-    d: Dict[str, Any] = {}
-    for ln in lines:
-        k, v = ln.split("=", 1)
-        k = k.strip()
-        v = v.strip().strip('"').strip("'")
-        if v.lower() in ("true","false"): d[k]= (v.lower()=="true")
-        else:
-            try: d[k]= float(v) if "." in v or v.isdigit() else v
-            except: d[k]= v
-    return d if d else None
-
-def normalize_payload(raw: bytes) -> Dict[str, Any]:
-    body = raw.decode("utf-8", "ignore").strip()
-    # 1) 순수 JSON
-    data = try_json(body)
-    if data: return data
-    # 2) 텍스트 + JSON 섞임
-    data = extract_first_json(body)
-    if data: return data
-    # 3) key=value 형태
-    data = kv_to_dict(body)
-    if data: return data
-    # 4) 못 읽으면 422 대신 에러 던지지 말고 로그 남김
-    raise HTTPException(status_code=400, detail="invalid payload (expect JSON)")
-
-# ---------- symbol mapping ----------
-def to_umcbl_from_tv(s: str) -> str:
+# ──────────────────────────────────────────────────────────────────────────────
+# 유틸: 액션/방향 판정
+# ──────────────────────────────────────────────────────────────────────────────
+def parse_action(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    TV: 'BTCUSDT.P' / 'BINANCE:BTCUSDT.P' / 'BTCUSDT' / 'BTCUSDT_UMCBL'
-     -> 'BTCUSDT_UMCBL'
+    다양한 포맷을 허용:
+      1) 우리 pine alert_message 포맷:
+         {"webhook_key":"...","action":"buy|sellshort|exit","symbol":"SUIUSDT.P","qty":123, ...}
+      2) 단순 템플릿:
+         {"secret":"...","symbol":"SUIUSDT_UMCBL","side":"buy|sell","orderType":"market","size":0.1}
     """
-    t = s.strip()
-    if ":" in t: t = t.split(":")[-1]
-    if t.endswith(".P"): t = t[:-2]
-    if t.endswith("_UMCBL") or t.endswith("_CMCBL"): return t
-    if t.endswith("USDT"): return t + "_UMCBL"
-    return t + "_UMCBL"
+    # 인증키
+    secret = payload.get("webhook_key") or payload.get("secret") or ""
+    if WEBHOOK_KEY and secret != WEBHOOK_KEY:
+        raise HTTPException(status_code=401, detail="invalid webhook key")
 
-def umcbl_to_ccxt_symbol(um: str) -> str:
-    # 'BTCUSDT_UMCBL' -> 'BTC/USDT:USDT'
-    if um.endswith("_UMCBL"): um = um[:-6]
-    if um.endswith("USDT"):
-        base = um[:-4]
-        return f"{base}/USDT:USDT"
-    return um
+    # 심볼
+    sym_in = payload.get("symbol") or payload.get("ticker") or ""
+    if not sym_in:
+        raise HTTPException(status_code=400, detail="missing symbol")
 
-# ---------- positions ----------
-async def fetch_open_symbols() -> Set[str]:
+    # 수량
+    qty = payload.get("qty")
+    if qty is None:
+        qty = payload.get("size")
     try:
-        poss = exchange.fetch_positions()
-    except Exception as e:
-        log.error(f"fetch_positions failed: {e}")
-        return set()
-    res = set()
-    for p in poss or []:
-        sym = p.get("symbol")
-        size = p.get("contracts") or p.get("size") or 0
-        try:
-            if sym and abs(float(size or 0))>0: res.add(sym)
-        except: pass
-    return res
-
-async def fetch_position_size(symbol: str) -> float:
-    try:
-        poss = exchange.fetch_positions([symbol])
+        qty = float(qty) if qty is not None else None
     except Exception:
-        try:
-            poss = exchange.fetch_positions()
-        except Exception as e:
-            log.error(f"fetch_position_size failed: {e}")
-            return 0.0
-    for p in poss or []:
-        if p.get("symbol")==symbol:
-            size = p.get("contracts") or p.get("size") or 0
-            try: return abs(float(size or 0))
-            except: return 0.0
-    return 0.0
+        qty = None
 
-@app.get("/health")
-async def health(): return {"ok": True}
+    # 액션/사이드
+    action = (payload.get("action") or payload.get("side") or "").lower()
 
-@app.get("/status")
-async def status():
+    # 표준화
+    if action in ("buy", "long"):
+        side = "buy"
+        reduce_only = False
+    elif action in ("sellshort", "short"):
+        side = "sell"
+        reduce_only = False
+    elif action in ("sell", "exit", "close", "flat"):
+        # 포지션 청산 의도
+        # (pine에서 exit은 qty=0 으로 오도록 해두었음)
+        side = "sell"  # 기본값 (롱 청산은 sell, 숏 청산은 buy로 바꿔 처리)
+        reduce_only = True
+    else:
+        # 기본: 전략 알림 템플릿에서 side가 buy/sell 로 올 수도 있음
+        if payload.get("side", "").lower() == "buy":
+            side = "buy"; reduce_only = False
+        elif payload.get("side", "").lower() == "sell":
+            side = "sell"; reduce_only = False
+        else:
+            raise HTTPException(status_code=400, detail=f"unknown action: {action}")
+
     return {
-        "live": True,
-        "dry_run": DRY_RUN,
-        "max_positions": MAX_POSITIONS,
-        "has_api_key": bool(BITGET_API_KEY),
-        "has_api_secret": bool(BITGET_API_SECRET),
-        "has_api_password": bool(BITGET_API_PASSWORD),
-        "webhook_secret_set": bool(WEBHOOK_SECRET),
-        "default_type": "swap",
+        "symbol_in": sym_in,
+        "side": side,
+        "qty": qty,
+        "reduce_only": reduce_only
     }
 
-@app.post("/webhook")
-async def webhook(request: Request, x_webhook_key: Optional[str] = Header(default=None)):
+# ──────────────────────────────────────────────────────────────────────────────
+# 주문 실행
+# ──────────────────────────────────────────────────────────────────────────────
+def place_order(ex: ccxt.bitget, symbol_in: str, side: str, qty: Optional[float], reduce_only: bool) -> Dict[str, Any]:
+    # TV → Bitget 심볼 변환
+    umcbl = tv_to_umcbl(symbol_in)  # e.g., SUIUSDT_UMCBL
+    ccxt_symbol = umcbl_to_ccxt(umcbl)  # e.g., SUI/USDT:USDT
+
+    # 포지션 제한(신규 진입만 체크)
+    if not reduce_only:
+        open_cnt = count_open_positions(ex)
+        if open_cnt >= MAX_OPEN:
+            return {"status": "ignored", "reason": f"max open positions reached ({open_cnt}/{MAX_OPEN})"}
+
+    # 현재 포지션 조회 (청산 시 사이드 반전용)
+    pos_side_needed = side
     try:
-        raw = await request.body()
-        data = normalize_payload(raw)
-
-        # ---- auth ----
-        provided = data.get("secret") or data.get("key") or data.get("webhook_key") or x_webhook_key
-        log.info(f"Auth check | provided={mask(provided)} | expected_set={bool(WEBHOOK_SECRET)}")
-        if WEBHOOK_SECRET and provided != WEBHOOK_SECRET:
-            raise HTTPException(status_code=401, detail="invalid webhook key")
-
-        # ---- symbol ----
-        raw_sym = str(data.get("symbol") or data.get("ticker") or data.get("symbol_tv") or "")
-        if not raw_sym:
-            raise HTTPException(status_code=400, detail="missing symbol")
-        umcbl = to_umcbl_from_tv(raw_sym)
-        symbol = umcbl_to_ccxt_symbol(umcbl)
-        log.info(f"Symbol map | in='{raw_sym}' -> umcbl='{umcbl}' -> ccxt='{symbol}'")
-
-        # ---- side / action ----
-        # 허용: side: buy/sell 또는 open_long/open_short/close_long/close_short
-        side_raw = str(data.get("side") or data.get("action") or "").lower()
-        reduce_only = bool(data.get("reduceOnly", False))
-
-        if side_raw in ("open_long", "long", "buy"):
-            side = "buy"; reduce_only = False
-        elif side_raw in ("open_short", "short", "sellshort"):
-            side = "sell"; reduce_only = False
-        elif side_raw in ("close_long","exit_long","sell"):
-            side = "sell"; reduce_only = True
-        elif side_raw in ("close_short","exit_short","buy_to_cover","buytocover","buy"):
-            side = "buy"; reduce_only = True
-        else:
-            # 전략 알림에서 action 텍스트만 올 수 있어 방어
-            if "sellshort" in side_raw: side="sell"; reduce_only=False
-            elif "exit_short" in side_raw: side="buy"; reduce_only=True
-            elif "exit_long" in side_raw: side="sell"; reduce_only=True
-            elif "buy" in side_raw: side="buy"
-            elif "sell" in side_raw: side="sell"
-            else:
-                raise HTTPException(status_code=400, detail=f"invalid side/action: {side_raw}")
-
-        # ---- open positions limit (entries only) ----
-        if not reduce_only:
-            opens = await fetch_open_symbols()
-            already = symbol in opens
-            log.info(f"Open symbols={list(opens)} (count={len(opens)}) | already_open={already}")
-            if not already and len(opens) >= MAX_POSITIONS:
-                return {"status": "blocked", "reason": "max positions reached", "open_symbols": list(opens)}
-
-        # ---- amount ----
-        amount = data.get("size") or data.get("qty") or data.get("amount")
-        if amount is None:
-            # 감소 주문이면 현 포지션 수량 조회
+        poss = ex.fetch_positions([ccxt_symbol])
+        if poss:
+            p = poss[0]
+            sz = float(p.get("contracts", 0) or 0)
             if reduce_only:
-                amount = await fetch_position_size(symbol)
-                log.info(f"ReduceOnly true -> fetched pos size={amount}")
-            else:
-                raise HTTPException(status_code=400, detail="qty/size required")
-        amount = float(amount)
-
-        # ---- min notional adjust (>= 5 USDT by default) ----
-        try:
-            mkt = exchange.market(symbol)
-            limits = (mkt.get("limits") or {})
-            min_cost = None
-            if limits.get("cost") and limits["cost"].get("min") is not None:
-                min_cost = float(limits["cost"]["min"])
-            if not min_cost: min_cost = 5.0
-            last = exchange.fetch_ticker(symbol)["last"]
-            notional = amount * float(last)
-            if notional < min_cost:
-                needed = min_cost / float(last)
-                prec = (mkt.get("precision") or {}).get("amount")
-                if prec is not None:
-                    step = 10 ** (-int(prec))
-                    amount = math.ceil(needed / step) * step
+                # 롱(>0) 청산이면 매도, 숏(<0) 청산이면 매수
+                if sz > 0:
+                    pos_side_needed = "sell"
+                elif sz < 0:
+                    pos_side_needed = "buy"
                 else:
-                    amount = math.ceil(needed * 1e6)/1e6
-                log.info(f"Adjusted amount | last={last}, min_cost={min_cost} -> amount={amount}")
-        except Exception as e:
-            log.warning(f"min-notional adjust skipped: {e}")
+                    return {"status": "ignored", "reason": "no open position to close"}
+    except Exception:
+        pass
 
-        if DRY_RUN:
-            log.info(f"[DRY] {symbol} {side} amount={amount} reduceOnly={reduce_only}")
-            return {"status": "ok(dry)", "symbol": symbol, "side": side, "amount": amount, "reduceOnly": reduce_only}
+    # 수량 결정
+    amount: Optional[float] = None
+    if not reduce_only:
+        # 균일 노출 강제
+        amount = compute_uniform_amount(ex, ccxt_symbol, reduce_only)
+        if amount is None:
+            # 실패시, 들어온 qty 사용 (없으면 에러)
+            if qty is None:
+                raise HTTPException(status_code=422, detail="missing qty for entry")
+            amount = float(qty)
+    else:
+        # 청산: 포지션 전량 close → reduceOnly + 큰 수량
+        # Bitget은 reduceOnly면 남은 수량만큼만 닫히므로 크게 줘도 안전
+        amount = 1e9
 
-        params = {"reduceOnly": reduce_only}
-        log.info(f"Placing order | symbol={symbol} side={side} amount={amount} params={params}")
-        result = exchange.create_order(symbol=symbol, type="market", side=side, amount=amount, params=params)
-        log.info(f"Order result: {json.dumps(result, default=str)[:1200]}")
-        return {"status": "ok", "result": result}
+    params = {
+        "reduceOnly": bool(reduce_only),
+        # 필요 시 timeInForce, positionMode 등 추가 가능
+    }
 
-    except HTTPException:
+    # 주문
+    print(f"Placing order | in='{symbol_in}' umcbl='{umcbl}' ccxt='{ccxt_symbol}' side='{pos_side_needed}' amount={amount} reduceOnly={reduce_only}")
+    order = ex.create_order(ccxt_symbol, "market", pos_side_needed, amount, None, params)
+    return {"status": "ok", "order": order, "ccxt_symbol": ccxt_symbol}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 라우트
+# ──────────────────────────────────────────────────────────────────────────────
+@app.get("/")
+def root():
+    return PlainTextResponse("tv-bitget-router alive. use POST /webhook")
+
+@app.get("/healthz")
+def healthz():
+    return PlainTextResponse("ok")
+
+@app.get("/status")
+def status():
+    try:
+        poss = exchange.fetch_positions()
+        open_symbols = sorted({p.get("symbol") for p in poss if abs(float(p.get("contracts", 0) or 0)) > 0})
+        return JSONResponse({"ok": True, "open_symbols": open_symbols, "max_open": MAX_OPEN})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)})
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    t0 = time.time()
+    body = await request.body()
+    try:
+        payload = json.loads(body.decode("utf-8") or "{}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid json")
+
+    try:
+        parsed = parse_action(payload)
+        res = place_order(
+            exchange,
+            symbol_in=parsed["symbol_in"],
+            side=parsed["side"],
+            qty=parsed["qty"],
+            reduce_only=parsed["reduce_only"],
+        )
+        dt = round((time.time() - t0) * 1000)
+        print(f"[webhook] done in {dt}ms | result={res.get('status')}")
+        return JSONResponse(res)
+    except HTTPException as he:
+        print(f"[webhook] http error {he.status_code}: {he.detail}")
         raise
     except Exception as e:
-        tb = traceback.format_exc()
-        log.error(f"Unhandled error: {e}\n{tb}")
-        raise HTTPException(status_code=500, detail=f"order failed: {str(e)}")
+        print("[webhook] error:", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ──────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
