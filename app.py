@@ -1,133 +1,132 @@
-import os
-import json
-import logging
-import traceback
+# app.py
+import os, json, time, hmac, hashlib, logging, traceback
+from typing import Dict, Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import httpx
-import hmac
-import hashlib
-import time
 
-# 로거 세팅
-logger = logging.getLogger("webhook")
+# -----------------------------
+# 로깅
+# -----------------------------
+logger = logging.getLogger("tv-bitget-router")
 logger.setLevel(logging.INFO)
 
-app = FastAPI()
+app = FastAPI(title="tv-bitget-router")
 
+# -----------------------------
 # 환경 변수
-API_KEY = os.getenv("BITGET_API_KEY", "")
-API_SECRET = os.getenv("BITGET_API_SECRET", "")
-API_PASSWORD = os.getenv("BITGET_API_PASSWORD", "")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() == "true"
-FORCE_EQUAL_NOTIONAL = os.getenv("FORCE_EQUAL_NOTIONAL", "true").lower() == "true"
+# -----------------------------
+API_KEY         = os.getenv("BITGET_API_KEY", "")
+API_SECRET      = os.getenv("BITGET_API_SECRET", "")
+API_PASSWORD    = os.getenv("BITGET_API_PASSWORD", "")
+WEBHOOK_SECRET  = os.getenv("WEBHOOK_SECRET", "")
+
+ALLOW_SHORTS    = os.getenv("ALLOW_SHORTS", "true").lower() == "true"
 FRACTION_PER_POSITION = float(os.getenv("FRACTION_PER_POSITION", "0.05"))
-MAX_COINS = int(os.getenv("MAX_COINS", "5"))
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+MAX_COINS       = int(os.getenv("MAX_COINS", "5"))
+DRY_RUN         = os.getenv("DRY_RUN", "false").lower() == "true"
 
-# Bitget API URL
-BASE_URL = "https://api.bitget.com"
+BASE_URL        = "https://api.bitget.com"
 
-# 현재 보유 심볼 추적 (메모리 상)
-open_positions = {}  # {"BTCUSDT.P": {"side": "long", "size": 123.4}, ...}
+# 메모리 포지션 추적: {"SYMBOL":{"side":"long|short","size":float}}
+open_positions: Dict[str, Dict[str, Any]] = {}
 
-# 상태 체크
+# -----------------------------
+# 응답 헬퍼 (항상 200)
+# -----------------------------
+def ok(payload: Dict[str, Any]) -> JSONResponse:
+    return JSONResponse({"ok": True, **payload}, status_code=200)
+
+def fail(msg: str, extra: Dict[str, Any] = None) -> JSONResponse:
+    payload = {"ok": False, "error": msg}
+    if extra:
+        payload.update(extra)
+    # TradingView 재시도 폭주 방지를 위해 200으로 고정
+    return JSONResponse(payload, status_code=200)
+
+# -----------------------------
+# 헬스 체크
+# -----------------------------
 @app.get("/status")
 def status():
-    return {"ok": True, "positions": open_positions}
+    return ok({"positions": open_positions})
 
-
+# -----------------------------
+# 웹훅
+# -----------------------------
 @app.post("/webhook")
 async def webhook(request: Request):
-    # 1) 원문 로깅
     try:
         raw = await request.body()
-        raw_text = raw.decode("utf-8", errors="replace")
         ct = request.headers.get("content-type", "")
+        raw_text = raw.decode("utf-8", errors="replace") if raw else ""
         logger.info(f"[WEBHOOK] CT={ct} RAW={raw_text[:500]}")
     except Exception:
-        logger.exception("Failed to read request body")
-        return JSONResponse({"ok": False, "error": "bad_body"}, status_code=400)
+        logger.exception("read body failed")
+        return fail("bad_body")
 
-    # 2) JSON 파싱
+    # JSON 파싱
     try:
-        if "application/json" in ct.lower():
-            data = await request.json()
-        else:
-            data = json.loads(raw_text)
+        data = await request.json() if "application/json" in (ct or "").lower() else json.loads(raw_text or "{}")
     except Exception:
-        logger.exception("Failed to parse JSON")
-        return JSONResponse({"ok": False, "error": "bad_json"}, status_code=400)
+        logger.exception("parse json failed")
+        return fail("bad_json")
 
-    # 3) 필수 필드 검증
+    # 필드 검증
     required = ("secret", "symbol", "side", "orderType", "size")
-    missing = [k for k in required if k not in data]
-    if missing:
-        logger.error(f"Missing fields: {missing} | data={data}")
-        return JSONResponse({"ok": False, "error": f"missing:{missing}"}, status_code=400)
+    miss = [k for k in required if k not in data]
+    if miss:
+        logger.error(f"missing fields: {miss} | data={data}")
+        return fail("missing_fields", {"missing": miss})
 
-    # 4) 비밀키 검증
-    if not WEBHOOK_SECRET:
-        logger.error("WEBHOOK_SECRET not set")
-    if data.get("secret") != WEBHOOK_SECRET:
-        logger.warning("Secret mismatch")
-        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    if not WEBHOOK_SECRET or data.get("secret") != WEBHOOK_SECRET:
+        logger.warning("secret mismatch")
+        return fail("unauthorized")
 
-    symbol = data["symbol"]
-    side = data["side"].lower()
-    order_type = data["orderType"].lower()
+    symbol = str(data["symbol"]).strip()
+    side   = str(data["side"]).lower().strip()            # "buy" | "sell"
+    _otype = str(data["orderType"]).lower().strip()       # "market" 등
     try:
-        size = float(data["size"])
+        size   = float(data["size"])
     except Exception:
-        logger.exception("Invalid size format")
-        return JSONResponse({"ok": False, "error": "bad_size"}, status_code=400)
+        return fail("bad_size")
 
-    # 5) 포지션 상태 기반 매핑
-    # 이미 포지션이 있는 경우: 반대 side는 "종료", 같은 side는 "물타기"
-    # 포지션이 없는 경우: buy=롱 진입, sell=숏 진입
-    pos = open_positions.get(symbol)
-
-    action = None
-    if pos:
-        if pos["side"] == "long":
-            if side == "buy":
-                action = "long_add"
-            else:
-                action = "long_close"
-        elif pos["side"] == "short":
-            if side == "sell":
-                action = "short_add"
-            else:
-                action = "short_close"
+    current = open_positions.get(symbol)
+    # 액션 결정
+    if current:
+        if current["side"] == "long":
+            action = "long_add" if side == "buy" else "long_close"
+        else:  # short
+            action = "short_add" if side == "sell" else "short_close"
     else:
         if side == "buy":
             action = "long_open"
-        else:
+        else:   # sell
             if ALLOW_SHORTS:
                 action = "short_open"
             else:
-                logger.info("Shorts not allowed, ignoring")
-                return {"ok": False, "skipped": "short_not_allowed"}
+                logger.info(f"short blocked for {symbol}")
+                return fail("short_not_allowed")
 
-    logger.info(f"Symbol={symbol}, Side={side}, Action={action}, Size={size}")
-
-    # 6) 최대 코인 제한 확인
+    # 신규 오픈 제한
     if action in ("long_open", "short_open") and len(open_positions) >= MAX_COINS:
-        logger.warning("Max coins reached, skipping new entry")
-        return {"ok": False, "skipped": "max_coins"}
+        logger.warning(f"max coins reached ({MAX_COINS}), skip new entry: {symbol}")
+        return fail("max_coins")
 
-    # 7) 주문 실행
+    logger.info(f"ACTION={action} symbol={symbol} size={size}")
+
+    # 주문 실행
     if DRY_RUN:
-        logger.info(f"DRY_RUN: would execute {action} {symbol} size={size}")
+        logger.info(f"DRY_RUN order: {action} {symbol} size={size}")
     else:
         try:
-            await place_order(symbol, action, size)
-        except Exception:
-            logger.exception("Order placement failed")
-            return JSONResponse({"ok": False, "error": "order_failed"}, status_code=500)
+            await place_order_bitget(symbol, action, size)
+        except Exception as e:
+            logger.error(f"order_failed: {e}\n{traceback.format_exc()}")
+            # 주문 실패해도 서버는 200으로 응답
+            return fail("order_failed", {"detail": str(e)})
 
-    # 8) 포지션 상태 갱신
+    # 포지션 현황 갱신
     if action == "long_open":
         open_positions[symbol] = {"side": "long", "size": size}
     elif action == "short_open":
@@ -137,55 +136,60 @@ async def webhook(request: Request):
     elif action in ("long_close", "short_close"):
         open_positions.pop(symbol, None)
 
-    return {"ok": True, "action": action, "symbol": symbol, "size": size}
+    return ok({"action": action, "symbol": symbol, "size": size, "positions": open_positions})
 
-
-async def place_order(symbol: str, action: str, size: float):
-    """
-    Bitget 주문 실행 (시장가)
-    """
-    timestamp = str(int(time.time() * 1000))
-    method = "POST"
-    request_path = "/api/mix/v1/order/placeOrder"
-
-    # 방향 결정
-    if action in ("long_open", "long_add"):
-        side = "buy"
-    elif action in ("short_open", "short_add"):
-        side = "sell"
-    elif action == "long_close":
-        side = "sell"
-    elif action == "short_close":
-        side = "buy"
+# -----------------------------
+# Bitget 주문 (시장가)
+# -----------------------------
+async def place_order_bitget(symbol: str, action: str, size: float):
+    # action -> 실제 주문 side
+    if action in ("long_open", "long_add", "short_close"):
+        trade_side = "buy"
+    elif action in ("short_open", "short_add", "long_close"):
+        trade_side = "sell"
     else:
-        raise ValueError("Unknown action")
+        raise ValueError(f"unknown action {action}")
+
+    ts = str(int(time.time() * 1000))
+    method = "POST"
+    path = "/api/mix/v1/order/placeOrder"
 
     body = {
         "symbol": symbol,
         "marginCoin": "USDT",
         "size": str(size),
-        "side": side,
+        "side": trade_side,
         "orderType": "market",
         "timeInForceValue": "normal"
     }
-    body_json = json.dumps(body)
+    payload = json.dumps(body, separators=(",", ":"))
 
-    pre_hash = timestamp + method + request_path + body_json
-    sign = hmac.new(API_SECRET.encode("utf-8"), pre_hash.encode("utf-8"), hashlib.sha256).digest()
-    sign_b64 = sign.hex()
+    # Bitget 서명 (문서 기준: ACCESS-SIGN = HMAC-SHA256(signStr) -> base64)
+    sign_str = ts + method + path + payload
+    sign = hmac.new(API_SECRET.encode(), sign_str.encode(), hashlib.sha256).digest()
+    sign_b64 = __import__("base64").b64encode(sign).decode()
 
     headers = {
         "ACCESS-KEY": API_KEY,
         "ACCESS-SIGN": sign_b64,
-        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-TIMESTAMP": ts,
         "ACCESS-PASSPHRASE": API_PASSWORD,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "locale": "en-US",
     }
 
-    async with httpx.AsyncClient() as client:
-        r = await client.post(BASE_URL + request_path, headers=headers, content=body_json, timeout=10.0)
+    url = BASE_URL + path
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.post(url, headers=headers, content=payload)
+        text = r.text
+        logger.info(f"[Bitget] {r.status_code} {text}")
         if r.status_code != 200:
-            raise Exception(f"Bitget API error {r.status_code}: {r.text}")
+            raise RuntimeError(f"bitget_status_{r.status_code}: {text}")
 
-    logger.info(f"Order placed: {body}")
-    return r.json()
+        # Bitget 에러코드 검사
+        try:
+            j = r.json()
+            if str(j.get("code")) not in ("00000", "0", "200"):
+                raise RuntimeError(f"bitget_resp_error: {j}")
+        except Exception as e:
+            raise RuntimeError(f"bitget_resp_parse_failed: {text}") from e
