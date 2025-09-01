@@ -1,195 +1,360 @@
 # app.py
-import os, json, time, hmac, hashlib, logging, traceback
-from typing import Dict, Any
-from fastapi import FastAPI, Request
+# -----------------------------------------------------------------------------
+# TradingView → FastAPI Webhook → Bitget(USDT-M SWAP) 주문 라우터 (ccxt async)
+# - 신규/추가/청산을 포지션 상태로 자동 판별
+# - reduceOnly 정확 적용(청산/감소 시)
+# - 청산 수량 포지션 수량으로 캡핑(초과 청산 방지)
+# - MAX_COINS, FRACTION_PER_POSITION, FORCE_EQUAL_NOTIONAL, ALLOW_SHORTS, DRY_RUN 지원
+# - TV 심볼(예: "1000BONKUSDT.P") → Bitget ccxt 심볼("1000BONK/USDT:USDT") 변환
+# - 풍부한 로깅
+# -----------------------------------------------------------------------------
+
+import os
+import json
+import math
+import asyncio
+from typing import Any, Dict, Optional
+
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
-import httpx
 
-# -----------------------------
-# 로깅
-# -----------------------------
-logger = logging.getLogger("tv-bitget-router")
-logger.setLevel(logging.INFO)
+import ccxt.async_support as ccxt  # async ccxt
+from pydantic import BaseModel
+from dotenv import load_dotenv
 
-app = FastAPI(title="tv-bitget-router")
+load_dotenv()
 
-# -----------------------------
-# 환경 변수
-# -----------------------------
-API_KEY         = os.getenv("BITGET_API_KEY", "")
-API_SECRET      = os.getenv("BITGET_API_SECRET", "")
-API_PASSWORD    = os.getenv("BITGET_API_PASSWORD", "")
-WEBHOOK_SECRET  = os.getenv("WEBHOOK_SECRET", "")
+# -----------------------------------------------------------------------------
+# 환경변수
+# -----------------------------------------------------------------------------
+BITGET_API_KEY = os.getenv("BITGET_API_KEY", "").strip()
+BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "").strip()
+BITGET_API_PASSWORD = os.getenv("BITGET_API_PASSWORD", "").strip()
 
-ALLOW_SHORTS    = os.getenv("ALLOW_SHORTS", "true").lower() == "true"
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+
+# 동작 옵션들
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+FORCE_EQUAL_NOTIONAL = os.getenv("FORCE_EQUAL_NOTIONAL", "true").lower() == "true"
+ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() == "true"
+
+# 시드 비중/최대 코인
 FRACTION_PER_POSITION = float(os.getenv("FRACTION_PER_POSITION", "0.05"))
-MAX_COINS       = int(os.getenv("MAX_COINS", "5"))
-DRY_RUN         = os.getenv("DRY_RUN", "false").lower() == "true"
+MAX_COINS = int(os.getenv("MAX_COINS", "5"))
 
-BASE_URL        = "https://api.bitget.com"
+# -----------------------------------------------------------------------------
+# FastAPI
+# -----------------------------------------------------------------------------
+app = FastAPI(title="tv-bitget-router", version="1.0.0")
 
-# 메모리 포지션 추적: {"SYMBOL":{"side":"long|short","size":float}}
-open_positions: Dict[str, Dict[str, Any]] = {}
+# 전역 거래소 인스턴스
+exchange: Optional[ccxt.bitget] = None
 
-# -----------------------------
-# 응답 헬퍼 (항상 200)
-# -----------------------------
-def ok(payload: Dict[str, Any]) -> JSONResponse:
-    return JSONResponse({"ok": True, **payload}, status_code=200)
-
-def fail(msg: str, extra: Dict[str, Any] = None) -> JSONResponse:
-    payload = {"ok": False, "error": msg}
-    if extra:
-        payload.update(extra)
-    # TradingView 재시도 폭주 방지를 위해 200으로 고정
-    return JSONResponse(payload, status_code=200)
-
-# -----------------------------
-# 헬스 체크
-# -----------------------------
-@app.get("/status")
-def status():
-    return ok({"positions": open_positions})
-
-# -----------------------------
-# 웹훅
-# -----------------------------
-@app.post("/webhook")
-async def webhook(request: Request):
-    try:
-        raw = await request.body()
-        ct = request.headers.get("content-type", "")
-        raw_text = raw.decode("utf-8", errors="replace") if raw else ""
-        logger.info(f"[WEBHOOK] CT={ct} RAW={raw_text[:500]}")
-    except Exception:
-        logger.exception("read body failed")
-        return fail("bad_body")
-
-    # JSON 파싱
-    try:
-        data = await request.json() if "application/json" in (ct or "").lower() else json.loads(raw_text or "{}")
-    except Exception:
-        logger.exception("parse json failed")
-        return fail("bad_json")
-
-    # 필드 검증
-    required = ("secret", "symbol", "side", "orderType", "size")
-    miss = [k for k in required if k not in data]
-    if miss:
-        logger.error(f"missing fields: {miss} | data={data}")
-        return fail("missing_fields", {"missing": miss})
-
-    if not WEBHOOK_SECRET or data.get("secret") != WEBHOOK_SECRET:
-        logger.warning("secret mismatch")
-        return fail("unauthorized")
-
-    symbol = str(data["symbol"]).strip()
-    side   = str(data["side"]).lower().strip()            # "buy" | "sell"
-    _otype = str(data["orderType"]).lower().strip()       # "market" 등
-    try:
-        size   = float(data["size"])
-    except Exception:
-        return fail("bad_size")
-
-    current = open_positions.get(symbol)
-    # 액션 결정
-    if current:
-        if current["side"] == "long":
-            action = "long_add" if side == "buy" else "long_close"
-        else:  # short
-            action = "short_add" if side == "sell" else "short_close"
+# -----------------------------------------------------------------------------
+# 유틸
+# -----------------------------------------------------------------------------
+def log(msg: str, **kw):
+    # 단순 로그 출력(uvicorn 로그로 확인)
+    if kw:
+        print(msg, "|", json.dumps(kw, ensure_ascii=False))
     else:
-        if side == "buy":
-            action = "long_open"
-        else:   # sell
-            if ALLOW_SHORTS:
-                action = "short_open"
+        print(msg)
+
+
+def tv_symbol_to_ccxt_symbol(tv_symbol: str) -> str:
+    """
+    TradingView 심볼(예: '1000BONKUSDT.P', 'BTCUSDT.P')을
+    Bitget USDT-M SWAP ccxt 심볼('1000BONK/USDT:USDT', 'BTC/USDT:USDT')로 변환
+    """
+    s = tv_symbol.strip().upper()
+    if s.endswith(".P"):
+        s = s[:-2]
+    if not s.endswith("USDT"):
+        # 혹시 모를 예외. 대다수는 USDT 페어
+        raise ValueError(f"unexpected tv symbol (no USDT tail): {tv_symbol}")
+    base = s[:-4]  # remove USDT
+    return f"{base}/USDT:USDT"
+
+
+def bool_env(v: str, default=False) -> bool:
+    if v is None:
+        return default
+    return v.lower() == "true"
+
+
+async def safe_fetch_ticker(symbol_ccxt: str) -> Optional[Dict[str, Any]]:
+    try:
+        return await exchange.fetch_ticker(symbol_ccxt)
+    except Exception as e:
+        log("fetch_ticker_error", symbol=symbol_ccxt, err=str(e))
+        return None
+
+
+def to_amount_precision(symbol_ccxt: str, amount: float) -> float:
+    try:
+        return float(exchange.amount_to_precision(symbol_ccxt, amount))
+    except Exception:
+        return float(f"{amount:.8f}")
+
+
+# -----------------------------------------------------------------------------
+# 포지션/사이드 판별 & 주문
+# -----------------------------------------------------------------------------
+async def get_position_size(symbol_ccxt: str) -> float:
+    """
+    현재 포지션 계약 수량을 방향부호로 반환
+    롱=+, 숏=-, 없음=0
+    """
+    try:
+        positions = await exchange.fetch_positions([symbol_ccxt])
+    except Exception as e:
+        log("fetch_positions_error", symbol=symbol_ccxt, err=str(e))
+        return 0.0
+
+    cur = 0.0
+    for p in positions:
+        if p.get("symbol") == symbol_ccxt:
+            contracts = float(p.get("contracts") or 0.0)
+            side = (p.get("side") or "").lower()
+            if side == "long":
+                cur = contracts
+            elif side == "short":
+                cur = -contracts
             else:
-                logger.info(f"short blocked for {symbol}")
-                return fail("short_not_allowed")
+                cur = 0.0
+            break
+    return cur
+
+
+async def get_open_coin_count() -> int:
+    """
+    현재 보유 중(계약>0)의 서로 다른 심볼 개수
+    """
+    try:
+        allpos = await exchange.fetch_positions()
+    except Exception as e:
+        log("fetch_positions_all_error", err=str(e))
+        return 0
+
+    seen = set()
+    for p in allpos:
+        contracts = float(p.get("contracts") or 0.0)
+        if contracts > 0:
+            seen.add(p.get("symbol"))
+    return len(seen)
+
+
+async def equal_notional_size(symbol_ccxt: str) -> Optional[float]:
+    """
+    FORCE_EQUAL_NOTIONAL=True인 경우 사용할
+    '현재 총자본 × FRACTION_PER_POSITION / 현재가격' 으로 계약수 산출
+    """
+    try:
+        bal = await exchange.fetch_balance()
+        # Bitget USDT-M 기준 자본: USDT 지갑 total (cross 기준)
+        usdt = bal.get("USDT") or {}
+        equity = float(usdt.get("total") or 0.0)
+        if equity <= 0:
+            # 혹시 general 'total' 사용
+            equity = float(bal.get("total", {}).get("USDT", 0.0))
+    except Exception as e:
+        log("fetch_balance_error", err=str(e))
+        return None
+
+    if equity <= 0:
+        log("equity_not_found_or_zero")
+        return None
+
+    tkr = await safe_fetch_ticker(symbol_ccxt)
+    if not tkr:
+        return None
+    last = float(tkr.get("last") or 0)
+    if last <= 0:
+        log("ticker_last_invalid", symbol=symbol_ccxt, ticker=tkr)
+        return None
+
+    notional = max(0.0, equity * FRACTION_PER_POSITION)
+    contracts = notional / last
+    contracts = to_amount_precision(symbol_ccxt, contracts)
+    return max(0.0, contracts)
+
+
+async def place_order_bitget(symbol_ccxt: str, tv_side: str, tv_size: float) -> Dict[str, Any]:
+    """
+    TradingView가 보낸 사이드/사이즈를 받아 Bitget에 정확한 조합으로 주문
+    - 포지션 상태를 읽어 신규/추가/감소/청산 판단
+    - reduceOnly 정확 세팅
+    - 청산 시 수량 캡핑
+    """
+    tv_side = tv_side.lower().strip()
+    if tv_side not in ("buy", "sell"):
+        raise RuntimeError(f"invalid tv_side: {tv_side}")
+
+    # 사이즈 결정: FORCE_EQUAL_NOTIONAL=true면 재계산
+    if FORCE_EQUAL_NOTIONAL:
+        calc = await equal_notional_size(symbol_ccxt)
+        if calc is not None and calc > 0:
+            req_size = calc
+        else:
+            req_size = max(0.0, float(tv_size))
+    else:
+        req_size = max(0.0, float(tv_size))
+
+    # 현재 포지션
+    cur = await get_position_size(symbol_ccxt)
 
     # 신규 오픈 제한
-    if action in ("long_open", "short_open") and len(open_positions) >= MAX_COINS:
-        logger.warning(f"max coins reached ({MAX_COINS}), skip new entry: {symbol}")
-        return fail("max_coins")
+    if cur == 0:
+        # 롱/숏 신규 오픈 허용 여부
+        if tv_side == "sell" and not ALLOW_SHORTS:
+            log("skip_open_short_disallowed", symbol=symbol_ccxt)
+            return {"skipped": True, "reason": "short_disallowed"}
 
-    logger.info(f"ACTION={action} symbol={symbol} size={size}")
+        # 최대 코인 제한 검사
+        open_cnt = await get_open_coin_count()
+        if open_cnt >= MAX_COINS:
+            log("skip_open_due_to_MAX_COINS", symbol=symbol_ccxt, open_cnt=open_cnt, MAX_COINS=MAX_COINS)
+            return {"skipped": True, "reason": "max_coins_reached"}
 
-    # 주문 실행
+        reduce_only = False
+        side_to_send = tv_side
+        size_to_send = req_size
+        intent = "OPEN"
+    elif cur > 0:
+        # 롱 보유
+        if tv_side == "buy":
+            reduce_only = False
+            side_to_send = "buy"
+            size_to_send = req_size
+            intent = "ADD_LONG"
+        else:
+            # sell → 롱 감소/청산
+            reduce_only = True
+            side_to_send = "sell"
+            size_to_send = min(abs(cur), req_size)
+            intent = "CLOSE_LONG"
+    else:
+        # 숏 보유(cur<0)
+        if tv_side == "sell":
+            reduce_only = False
+            side_to_send = "sell"
+            size_to_send = req_size
+            intent = "ADD_SHORT"
+        else:
+            # buy → 숏 감소/청산
+            reduce_only = True
+            side_to_send = "buy"
+            size_to_send = min(abs(cur), req_size)
+            intent = "CLOSE_SHORT"
+
+    size_to_send = to_amount_precision(symbol_ccxt, size_to_send)
+
+    if size_to_send <= 0:
+        log("skip_zero_size", symbol=symbol_ccxt, intent=intent, cur=cur, tv_side=tv_side)
+        return {"skipped": True, "reason": "zero_size", "intent": intent}
+
+    # 디버깅용 상세 로그
+    log("order_intent",
+        intent=intent, tv_side=tv_side, bitget_side=side_to_send,
+        reduceOnly=reduce_only, size=size_to_send, cur_pos=cur, symbol=symbol_ccxt)
+
     if DRY_RUN:
-        logger.info(f"DRY_RUN order: {action} {symbol} size={size}")
-    else:
-        try:
-            await place_order_bitget(symbol, action, size)
-        except Exception as e:
-            logger.error(f"order_failed: {e}\n{traceback.format_exc()}")
-            # 주문 실패해도 서버는 200으로 응답
-            return fail("order_failed", {"detail": str(e)})
+        log("DRY_RUN_order_skipped")
+        return {"dry_run": True, "intent": intent, "side": side_to_send, "size": size_to_send}
 
-    # 포지션 현황 갱신
-    if action == "long_open":
-        open_positions[symbol] = {"side": "long", "size": size}
-    elif action == "short_open":
-        open_positions[symbol] = {"side": "short", "size": size}
-    elif action in ("long_add", "short_add"):
-        open_positions[symbol]["size"] += size
-    elif action in ("long_close", "short_close"):
-        open_positions.pop(symbol, None)
-
-    return ok({"action": action, "symbol": symbol, "size": size, "positions": open_positions})
-
-# -----------------------------
-# Bitget 주문 (시장가)
-# -----------------------------
-async def place_order_bitget(symbol: str, action: str, size: float):
-    # action -> 실제 주문 side
-    if action in ("long_open", "long_add", "short_close"):
-        trade_side = "buy"
-    elif action in ("short_open", "short_add", "long_close"):
-        trade_side = "sell"
-    else:
-        raise ValueError(f"unknown action {action}")
-
-    ts = str(int(time.time() * 1000))
-    method = "POST"
-    path = "/api/mix/v1/order/placeOrder"
-
-    body = {
-        "symbol": symbol,
-        "marginCoin": "USDT",
-        "size": str(size),
-        "side": trade_side,
-        "orderType": "market",
-        "timeInForceValue": "normal"
-    }
-    payload = json.dumps(body, separators=(",", ":"))
-
-    # Bitget 서명 (문서 기준: ACCESS-SIGN = HMAC-SHA256(signStr) -> base64)
-    sign_str = ts + method + path + payload
-    sign = hmac.new(API_SECRET.encode(), sign_str.encode(), hashlib.sha256).digest()
-    sign_b64 = __import__("base64").b64encode(sign).decode()
-
-    headers = {
-        "ACCESS-KEY": API_KEY,
-        "ACCESS-SIGN": sign_b64,
-        "ACCESS-TIMESTAMP": ts,
-        "ACCESS-PASSPHRASE": API_PASSWORD,
-        "Content-Type": "application/json",
-        "locale": "en-US",
+    params = {
+        "reduceOnly": reduce_only,
     }
 
-    url = BASE_URL + path
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.post(url, headers=headers, content=payload)
-        text = r.text
-        logger.info(f"[Bitget] {r.status_code} {text}")
-        if r.status_code != 200:
-            raise RuntimeError(f"bitget_status_{r.status_code}: {text}")
+    try:
+        order = await exchange.create_order(
+            symbol=symbol_ccxt,
+            type="market",
+            side=side_to_send,
+            amount=size_to_send,
+            params=params,
+        )
+        log("order_ok", order=order)
+        return order
+    except ccxt.BaseError as e:
+        log("order_failed", err=str(e))
+        raise
 
-        # Bitget 에러코드 검사
-        try:
-            j = r.json()
-            if str(j.get("code")) not in ("00000", "0", "200"):
-                raise RuntimeError(f"bitget_resp_error: {j}")
-        except Exception as e:
-            raise RuntimeError(f"bitget_resp_parse_failed: {text}") from e
+
+# -----------------------------------------------------------------------------
+# 요청 스키마
+# -----------------------------------------------------------------------------
+class TVPayload(BaseModel):
+    secret: Optional[str] = None
+    symbol: str
+    side: str                # "buy" | "sell"
+    orderType: Optional[str] = "market"  # 무시(시장가 고정)
+    size: Optional[float] = 0
+
+
+# -----------------------------------------------------------------------------
+# FastAPI hooks
+# -----------------------------------------------------------------------------
+@app.on_event("startup")
+async def startup():
+    global exchange
+    if not (BITGET_API_KEY and BITGET_API_SECRET and BITGET_API_PASSWORD):
+        log("WARNING_api_keys_missing_or_empty")
+    exchange = ccxt.bitget({
+        "apiKey": BITGET_API_KEY,
+        "secret": BITGET_API_SECRET,
+        "password": BITGET_API_PASSWORD,
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": "swap",      # USDT-M Perp
+        },
+    })
+    # 시장 메타 프리로드(precision 사용)
+    try:
+        await exchange.load_markets()
+    except Exception as e:
+        log("load_markets_error", err=str(e))
+    log("startup_done", dry_run=DRY_RUN, force_equal_notional=FORCE_EQUAL_NOTIONAL,
+        allow_shorts=ALLOW_SHORTS, fraction_per_position=FRACTION_PER_POSITION, max_coins=MAX_COINS)
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    try:
+        await exchange.close()
+    except Exception:
+        pass
+    log("shutdown_done")
+
+
+# -----------------------------------------------------------------------------
+# 라우트
+# -----------------------------------------------------------------------------
+@app.get("/")
+async def status():
+    return {"status": "ok", "service": "tv-bitget-router"}
+
+@app.post("/webhook")
+async def webhook(payload: TVPayload, request: Request):
+    # 1) 보안 토큰 검사
+    if WEBHOOK_SECRET:
+        if not payload.secret or payload.secret != WEBHOOK_SECRET:
+            raise HTTPException(status_code=401, detail="invalid secret")
+
+    # 2) TV → Bitget 심볼 변환
+    try:
+        symbol_ccxt = tv_symbol_to_ccxt_symbol(payload.symbol)
+    except Exception as e:
+        log("symbol_convert_error", tv_symbol=payload.symbol, err=str(e))
+        raise HTTPException(status_code=422, detail=f"bad symbol: {payload.symbol}")
+
+    # 3) 주문 실행
+    try:
+        res = await place_order_bitget(symbol_ccxt, payload.side, float(payload.size or 0.0))
+        return JSONResponse({"ok": True, "result": res})
+    except ccxt.BaseError as e:
+        # Bitget/ccxt 에러를 그대로 노출(로그에는 남겨둠)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    except Exception as e:
+        log("unhandled_error", err=str(e))
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
