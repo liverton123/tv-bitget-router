@@ -1,343 +1,474 @@
-# app.py
-import os
-import re
-import json
-import time
-import math
-import asyncio
-import logging
-from typing import Optional, Dict, Any
+# app.py  — tv-bitget-router (FULL VERSION)
 
-from fastapi import FastAPI, Request
+import os
+import json
+import math
+import time
+import logging
+from typing import Dict, Optional, Tuple
+
+from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from cachetools import TTLCache
 
-import ccxt.async_support as ccxt  # 비동기 ccxt
-from dotenv import load_dotenv
+import ccxt.async_support as ccxt  # asyncio 버전
+import asyncio
 
 # ----------------------------
-# 기본 세팅
+# Logging
 # ----------------------------
-load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-logger = logging.getLogger("router")
+logger = logging.getLogger("tv-bitget-router")
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s"
+    )
 
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mySecret123!")
-ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() == "true"
-FRACTION_PER_POSITION = float(os.getenv("FRACTION_PER_POSITION", "0.05"))  # 1/20
-MAX_COINS = int(os.getenv("MAX_COINS", "5"))
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
-
+# ----------------------------
+# ENV
+# ----------------------------
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 BITGET_API_KEY = os.getenv("BITGET_API_KEY", "")
 BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "")
 BITGET_API_PASSWORD = os.getenv("BITGET_API_PASSWORD", "")
 
-# ccxt 객체/마켓 캐시
-exchange: Optional[ccxt.bitget] = None
-markets: Dict[str, Any] = {}
-markets_cache = TTLCache(maxsize=1, ttl=60 * 60)  # 1시간
+# 포지션당 지갑의 고정 마진 비율 (예: 1/20 = 0.05)
+FRACTION_PER_POSITION = float(os.getenv("FRACTION_PER_POSITION", "0.05"))
 
-# 최근 포지션 목록 캐시 (Bitget fetchPositions 가끔 느릴 수 있어 10초 캐시)
-positions_cache: TTLCache = TTLCache(maxsize=1, ttl=10)
+# 최대 동시 보유 코인 수 (롱/숏 합계가 아니라 '코인 심볼' 개수 기준)
+MAX_COINS = int(os.getenv("MAX_COINS", "5"))
 
-app = FastAPI()
+# 숏 허용 여부
+ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() == "true"
 
+# 드라이런
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+
+# (안전) 기본 레버리지 가정값 (Bitget UI에 설정된 실제 레버리지 조회가 실패할 때만 사용)
+DEFAULT_ASSUMED_LEVERAGE = float(os.getenv("DEFAULT_ASSUMED_LEVERAGE", "10"))
+
+# Bitget product / margin coin
+MARGIN_COIN = "USDT"
+PRODUCT_TYPE = "USDT-FUTURES"  # Bitget v2 mix endpoints
 
 # ----------------------------
-# 모델
+# FastAPI
+# ----------------------------
+app = FastAPI()
+
+# ----------------------------
+# Exchange (ccxt)
+# ----------------------------
+ex: Optional[ccxt.bitget] = None
+markets_loaded = False
+
+# 최근 처리된 알림 키(idempotency) — 중복 체결 방지
+# key 예: f"{symbol}|{side}|{rounded_size}"
+recent_alerts = TTLCache(maxsize=5000, ttl=90)
+
+# 오픈 심볼 캐시 (현재 보유중인 코인 심볼 세트)
+open_symbols_cache: Dict[str, str] = {}  # { "BTC/USDT:USDT": "long"/"short" }
+
+# ----------------------------
+# Models
 # ----------------------------
 class TVAlert(BaseModel):
     secret: Optional[str] = None
     symbol: str
-    side: str                    # "buy" | "sell"
+    side: str
     orderType: Optional[str] = "market"
-    size: Optional[float] = None # (참고용, 실제 수량은 마진/가격으로 산출)
+    size: Optional[float] = None
 
 
 # ----------------------------
-# 유틸 & 초기화
+# Helpers
 # ----------------------------
-async def ensure_exchange():
-    """ccxt bitget 초기화 + 마켓 로딩(캐시)"""
-    global exchange, markets
-    if exchange is None:
-        exchange = ccxt.bitget({
-            "apiKey": BITGET_API_KEY,
-            "secret": BITGET_API_SECRET,
-            "password": BITGET_API_PASSWORD,
-            "enableRateLimit": True,
-            "options": {
-                "defaultType": "swap",  # 선물(USDT-Perp)
-            },
-        })
-    if "markets" not in markets_cache:
-        await exchange.load_markets(True)
-        markets = exchange.markets
-        markets_cache["markets"] = True
-
-
-def tv_symbol_to_ccxt(tv_symbol: str) -> str:
+def tv_to_ccxt_symbol(tv_symbol: str) -> Optional[str]:
     """
-    TradingView 심볼 -> Bitget(CCXT) 심볼
-    입력 예: SPKUSDT.P / 1000BONKUSDT.P / ETHUSDT.P / VIRTUALUSDT.P
-    출력 예: SPK/USDT:USDT / 1000BONK/USDT:USDT / ETH/USDT:USDT / VIRTUAL/USDT:USDT
+    TradingView 심볼 (예: 'HBARUSDT.P') -> ccxt 심볼 (예: 'HBAR/USDT:USDT')
+    실패하면 None
     """
-    raw = tv_symbol.strip()
-    s = raw.replace(".P", "")
-    s = re.sub(r"(PERP)$", "", s, flags=re.IGNORECASE)
-
-    m = re.match(r"^(.+?)USDT$", s, flags=re.IGNORECASE)
-    base = m.group(1) if m else s  # 끝의 USDT 제거
-
-    # 후보 순회
-    candidates = [
-        f"{base}/USDT:USDT",
-        f"{base}/USDT",
-        base,
-    ]
-    for cand in candidates:
-        if cand in markets:
-            return markets[cand]["symbol"]
-
-    # 느슨 매칭: base/quote로 비교
-    upper_base = base.upper()
-    for mkt in markets.values():
-        if mkt.get("type") == "swap" and mkt.get("linear"):
-            if mkt.get("base", "").upper() == upper_base and mkt.get("quote", "").upper() == "USDT":
-                return mkt["symbol"]
-
-    # 마지막 fallback
+    s = tv_symbol.upper().replace(".P", "").strip()
+    if not s.endswith("USDT"):
+        return None
+    base = s[:-4]
+    if not base:
+        return None
+    # ccxt(비트겟 선물) 표준 표기
     return f"{base}/USDT:USDT"
 
 
-async def fetch_price(symbol: str) -> float:
-    """마켓가(가격) 조회"""
-    try:
-        ticker = await exchange.fetch_ticker(symbol)
-        # ticker['last'] 없으면 mid로
-        price = ticker.get("last") or (ticker["bid"] + ticker["ask"]) / 2
-        return float(price)
-    except Exception as e:
-        logger.warning(f"fetch_price fail {symbol}: {e}")
-        raise
-
-
-async def fetch_equity_usdt() -> float:
-    """지갑 총액(USDT 기준) – 현재 시드로 간주"""
-    bal = await exchange.fetch_balance()
-    usdt = bal.get("USDT", {})
-    # total 이 없으면 free 사용
-    equity = float(usdt.get("total") or usdt.get("free") or 0.0)
-    return equity
-
-
-async def fetch_positions_map() -> Dict[str, Dict[str, Any]]:
-    """
-    현재 보유 포지션 맵:
-      { symbol: {"side": "long|short", "contracts": float} ... }
-    contracts는 포지션 수량(계약수) – 0 이면 미보유
-    """
-    if "positions" in positions_cache:
-        return positions_cache["positions"]
-
-    pos_map: Dict[str, Dict[str, Any]] = {}
-    try:
-        positions = await exchange.fetch_positions()
-        for p in positions:
-            # 스왑/USDT 만 사용
-            if p.get("marginMode") == "cross" or True:
-                sym = p.get("symbol")
-                contracts = float(p.get("contracts") or p.get("contractSize") or 0.0)
-                if contracts <= 0:
-                    continue
-                side = p.get("side")
-                # 일부 거래소는 "long"/"short" 대신 "sell"/"buy" 형태일 수도 있으니 정규화
-                if side not in ("long", "short"):
-                    if float(p.get("contracts", 0)) > 0 and float(p.get("unrealizedPnl", 0)) is not None:
-                        # ccxt bitget 은 기본적으로 side 제공함
-                        pass
-                pos_map[sym] = {"side": side, "contracts": contracts}
-    except Exception as e:
-        logger.warning(f"fetch_positions failed: {e}")
-
-    positions_cache["positions"] = pos_map
-    return pos_map
-
-
-def count_open_symbols(pos_map: Dict[str, Dict[str, Any]]) -> int:
-    return len(pos_map)
-
-
-def calc_order_amount(price: float, equity: float) -> float:
-    """
-    주문 수량(코인 수) = (equity × FRACTION_PER_POSITION) / price
-    - 레버리지는 Bitget UI에서 설정된 값을 따름. (여기선 마진만 관리)
-    """
-    margin_usdt = max(0.0, equity * FRACTION_PER_POSITION)
-    if margin_usdt <= 0 or price <= 0:
-        return 0.0
-    qty = margin_usdt / price
-    return qty
-
-
-async def place_order_bitget(symbol: str, side: str, amount: float, reduce_only: bool) -> Dict[str, Any]:
-    """
-    Bitget 주문 래퍼 – market + reduceOnly 지원
-    side: 'buy' | 'sell'
-    """
+def round_amount(market: dict, amount: float) -> float:
+    """시장 정밀도/스텝에 맞게 수량 반올림"""
     if amount <= 0:
-        raise ValueError("amount must be > 0")
+        return 0.0
+    precision = market.get("precision", {}).get("amount")
+    step = market.get("limits", {}).get("amount", {}).get("min")
+    # precision 우선
+    if precision is not None:
+        amount = float(ex.amount_to_precision(market["symbol"], amount))
+    # 최소 수량 보정
+    min_amt = market.get("limits", {}).get("amount", {}).get("min")
+    if min_amt:
+        if amount < float(min_amt):
+            amount = 0.0
+    return amount
 
-    params = {"reduceOnly": reduce_only}
+
+async def ensure_exchange():
+    """ccxt bitget 인스턴스 준비 & 마켓 로드 & 보유 포지션 동기화"""
+    global ex, markets_loaded, open_symbols_cache
+
+    if ex is None:
+        ex = ccxt.bitget({
+            "apiKey": BITGET_API_KEY,
+            "secret": BITGET_API_SECRET,
+            "password": BITGET_API_PASSWORD,
+            "options": {
+                "defaultType": "swap",  # 선물
+            },
+            "enableRateLimit": True,
+        })
+
+    if not markets_loaded:
+        await ex.load_markets()
+        markets_loaded = True
+        logger.info("Bitget markets loaded")
+
+    # 부팅/재시작 후 한번 현재 보유 포지션 동기화
+    if not open_symbols_cache:
+        try:
+            # ccxt의 통합 포지션 조회 (모든 심볼)
+            positions = await ex.fetch_positions()
+            for p in positions:
+                sym = p.get("symbol")
+                contracts = float(p.get("contracts", 0) or 0)
+                side = p.get("side")
+                if contracts > 0 and side in ("long", "short"):
+                    open_symbols_cache[sym] = side
+            if open_symbols_cache:
+                logger.info(f"Open symbols synced: {open_symbols_cache}")
+        except Exception as e:
+            logger.warning(f"fetch_positions failed (will continue): {e}")
+
+
+async def get_price(symbol: str) -> Optional[float]:
+    """마크 프라이스 근사값"""
     try:
-        if DRY_RUN:
-            logger.info(f"[DRY] create_order {symbol} {side} {amount} reduceOnly={reduce_only}")
-            return {"dry": True}
-
-        order = await exchange.create_order(
-            symbol=symbol,
-            type="market",
-            side=side,
-            amount=amount,
-            params=params,
-        )
-        return order
-    except ccxt.BaseError as ex:
-        # Bitget 오류 메시지를 그대로 노출
-        text = getattr(ex, "args", [""])[0]
-        logger.error(f"order_failed: {text}")
-        raise
+        ticker = await ex.fetch_ticker(symbol)
+        # Bitget 선물에서는 mark/stats가 없는 경우도 있으니
+        price = ticker.get("last") or ticker.get("close") or ticker.get("ask") or ticker.get("bid")
+        return float(price) if price else None
+    except Exception as e:
+        logger.warning(f"fetch_ticker failed {symbol}: {e}")
+        return None
 
 
-# ----------------------------
-# 라우트
-# ----------------------------
-@app.get("/status")
-async def status():
-    await ensure_exchange()
-    return {
-        "ok": True,
-        "markets_loaded": len(markets) > 0,
-        "fraction_per_position": FRACTION_PER_POSITION,
-        "max_coins": MAX_COINS,
-        "allow_shorts": ALLOW_SHORTS,
-        "dry_run": DRY_RUN,
+async def get_user_leverage(symbol: str, market: dict) -> float:
+    """
+    유저가 Bitget UI에서 설정한 레버리지를 얻는다.
+    실패 시 DEFAULT_ASSUMED_LEVERAGE로 fallback.
+    """
+    try:
+        # Bitget v2 mix position single-position (ccxt raw 호출)
+        # ccxt 메서드명 추정: privateMixGetV2MixPositionSinglePosition
+        # 필요한 파라미터: symbol(id), productType, marginCoin
+        bitget_symbol_id = market.get("id")
+        if hasattr(ex, "privateMixGetV2MixPositionSinglePosition"):
+            resp = await ex.privateMixGetV2MixPositionSinglePosition({
+                "symbol": bitget_symbol_id,
+                "productType": PRODUCT_TYPE,
+                "marginCoin": MARGIN_COIN,
+            })
+            data = (resp or {}).get("data")
+            # 포지션이 없으면 빈 객체/None 일 수 있음
+            if data and isinstance(data, dict):
+                lev = data.get("leverage")
+                if lev is not None:
+                    return float(lev)
+    except Exception as e:
+        logger.info(f"get_user_leverage fallback -> {e}")
+
+    return DEFAULT_ASSUMED_LEVERAGE
+
+
+async def get_equity_usdt() -> float:
+    """지갑(USDT) 총 잔고 (cross equity에 가장 근접)"""
+    try:
+        bal = await ex.fetch_balance()
+        u = bal.get("USDT") or {}
+        # total 또는 free 중 total 우선
+        total = u.get("total")
+        if total is None:
+            total = u.get("free", 0)
+        return float(total or 0)
+    except Exception as e:
+        logger.warning(f"fetch_balance failed: {e}")
+        return 0.0
+
+
+def is_duplicate(alert: TVAlert) -> bool:
+    """같은 알림 중복 처리 방지 (짧은 시간 내 동일 키는 skip)"""
+    key = f"{alert.symbol}|{alert.side}|{round(float(alert.size or 0), 6)}"
+    if key in recent_alerts:
+        return True
+    recent_alerts[key] = time.time()
+    return False
+
+
+async def figure_position_side(symbol: str) -> Optional[str]:
+    """
+    현재 보유중인 포지션 방향 반환: "long"/"short"/None
+    캐시 우선, 캐시 없으면 조회
+    """
+    if symbol in open_symbols_cache:
+        return open_symbols_cache[symbol]
+
+    try:
+        # ccxt 통합 포지션 조회 (심볼 지정)
+        pos = await ex.fetch_position(symbol)
+        contracts = float(pos.get("contracts", 0) or 0)
+        side = pos.get("side")
+        if contracts > 0 and side in ("long", "short"):
+            open_symbols_cache[symbol] = side
+            return side
+    except Exception:
+        # 일부 거래소는 fetch_position 미지원 -> fetch_positions 후 필터 대체
+        try:
+            positions = await ex.fetch_positions([symbol])
+            for p in positions:
+                if p.get("symbol") == symbol:
+                    contracts = float(p.get("contracts", 0) or 0)
+                    side = p.get("side")
+                    if contracts > 0 and side in ("long", "short"):
+                        open_symbols_cache[symbol] = side
+                        return side
+        except Exception:
+            pass
+    return None
+
+
+def update_open_symbols(symbol: str, side_after: Optional[str]):
+    """체결 후 오픈심볼 캐시 갱신"""
+    if side_after is None:
+        if symbol in open_symbols_cache:
+            del open_symbols_cache[symbol]
+    else:
+        open_symbols_cache[symbol] = side_after
+
+
+async def calc_open_amount(symbol: str, market: dict) -> Tuple[float, float]:
+    """
+    신규(또는 물타기) 진입 시 주문 수량 계산.
+    - 목표 마진 = equity * FRACTION_PER_POSITION
+    - 실제 레버리지는 bitget에 설정된 값 조회 (실패시 기본값)
+    - 목표 명목가(notional) = 목표 마진 * 레버리지
+    - 수량 = notional / 현재가
+    반환: (amount, price)  ; amount=0이면 스킵
+    """
+    price = await get_price(symbol)
+    if not price or price <= 0:
+        return 0.0, 0.0
+
+    equity = await get_equity_usdt()
+    if equity <= 0:
+        return 0.0, price
+
+    # 목표 "마진" (지갑의 1/20)
+    target_margin = equity * FRACTION_PER_POSITION
+
+    # 심볼별 설정 레버리지 (Bitget UI)
+    lev = await get_user_leverage(symbol, market)
+
+    # 목표 명목가(=주문 금액)
+    desired_notional = target_margin * lev
+
+    # 수량(계약수)
+    raw_amount = desired_notional / price
+    amount = round_amount(market, raw_amount)
+
+    return amount, price
+
+
+async def place_order_bitget(symbol: str, side: str, amount: float, reduce_only: bool) -> dict:
+    """비트겟 마켓 주문"""
+    params = {
+        "reduceOnly": reduce_only,
+        "marginCoin": MARGIN_COIN,
     }
+    if DRY_RUN:
+        logger.info(f"[DRY_RUN] create_order {symbol} {side} {amount} reduceOnly={reduce_only}")
+        return {"dryrun": True}
+
+    return await ex.create_order(
+        symbol=symbol,
+        type="market",
+        side=side,
+        amount=amount,
+        params=params
+    )
+
+
+# ----------------------------
+# Routes
+# ----------------------------
+@app.get("/")
+async def root():
+    await ensure_exchange()
+    return {"ok": True, "service": "tv-bitget-router", "open_symbols": open_symbols_cache}
 
 
 @app.post("/webhook")
-async def webhook(msg: TVAlert, request: Request):
-    started = time.time()
+async def webhook(req: Request):
     await ensure_exchange()
 
-    # 시크릿 검증
-    if WEBHOOK_SECRET and msg.secret and msg.secret != WEBHOOK_SECRET:
-        logger.info(f"skip: secret mismatch for {msg.symbol}")
-        return {"ok": True, "skipped": "secret_mismatch"}
+    try:
+        payload = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    tv_side = msg.side.lower().strip()  # 'buy' | 'sell'
-    tv_symbol = msg.symbol.strip()
+    try:
+        alert = TVAlert(**payload)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Bad payload: {e}")
+
+    # Secret 검증
+    if WEBHOOK_SECRET and (alert.secret or "") != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # 중복 알림 방지
+    if is_duplicate(alert):
+        logger.info(f"skip duplicate: {alert.symbol} {alert.side} {alert.size}")
+        return {"ok": True, "skip": "duplicate"}
 
     # 심볼 매핑
-    ccxt_symbol = tv_symbol_to_ccxt(tv_symbol)
+    ccxt_symbol = tv_to_ccxt_symbol(alert.symbol)
+    if not ccxt_symbol:
+        logger.info(f"skip: cannot map symbol {alert.symbol}")
+        return {"ok": True, "skip": "bad_symbol"}
 
-    if ccxt_symbol not in markets:
-        logger.info(f"skip: unknown symbol mapped -> {ccxt_symbol} (from {tv_symbol})")
-        return {"ok": True, "skipped": "unknown_symbol", "tv_symbol": tv_symbol, "mapped": ccxt_symbol}
+    if ccxt_symbol not in ex.markets:
+        logger.info(f"skip: market not found {ccxt_symbol}")
+        return {"ok": True, "skip": "unknown_market"}
 
-    # 현재 포지션 맵
-    pos_map = await fetch_positions_map()
-    cur = pos_map.get(ccxt_symbol)  # None | {"side": "long|short", "contracts": f}
+    market = ex.markets[ccxt_symbol]
 
-    # 현재 가격 & 내 시드
-    try:
-        price = await fetch_price(ccxt_symbol)
-    except Exception:
-        return {"ok": False, "error": "price_fetch_failed"}
-    equity = await fetch_equity_usdt()
+    # 현재 보유 방향 파악
+    held_side = await figure_position_side(ccxt_symbol)  # "long"/"short"/None
 
-    # 주문 수량 계산(마진=시드×fraction / price)
-    qty = calc_order_amount(price, equity)
+    tv_side = (alert.side or "").lower().strip()
+    if tv_side not in ("buy", "sell"):
+        return {"ok": True, "skip": "bad_side"}
 
-    # 포지션/시그널 조합별 의사결정
-    # 1) 현재 포지션 없음
-    if cur is None:
-        # 신규 오픈 제한
-        open_cnt = count_open_symbols(pos_map)
-        can_open_new = open_cnt < MAX_COINS
+    # 액션 판정
+    # buy  : long 열기 or short 청산
+    # sell : short 열기 or long 청산
+    reduce_only = False
+    order_side = tv_side  # ccxt order side (buy/sell)
 
-        if tv_side == "buy":
-            # 신규 롱 오픈
-            if not can_open_new:
-                logger.info(f"skip: MAX_COINS reached. cannot open LONG {ccxt_symbol}")
-                return {"ok": True, "skipped": "max_coins", "intent": "open_long"}
-            side = "buy"
-            reduce_only = False
-        else:  # "sell"
-            # 신규 숏 오픈
-            if not ALLOW_SHORTS:
-                logger.info(f"skip: shorts disabled")
-                return {"ok": True, "skipped": "shorts_disabled"}
-            if not can_open_new:
-                logger.info(f"skip: MAX_COINS reached. cannot open SHORT {ccxt_symbol}")
-                return {"ok": True, "skipped": "max_coins", "intent": "open_short"}
-            side = "sell"
-            reduce_only = False
+    if tv_side == "buy":
+        if held_side == "short":
+            reduce_only = True  # 숏 청산
+        else:
+            reduce_only = False  # 롱 신규/추가
+    else:  # tv_side == "sell"
+        if held_side == "long":
+            reduce_only = True  # 롱 청산
+        else:
+            reduce_only = False  # 숏 신규/추가
 
-        if qty <= 0:
-            logger.info(f"skip: calc amount is zero | {{'symbol': '{ccxt_symbol}', 'price': {price}}}")
-            return {"ok": True, "skipped": "zero_amount"}
+    # 숏 신규 진입 허용 검사
+    if (held_side is None) and (tv_side == "sell") and (not ALLOW_SHORTS):
+        logger.info(f"skip: shorts not allowed ({ccxt_symbol})")
+        return {"ok": True, "skip": "shorts_blocked"}
 
-        order = await place_order_bitget(ccxt_symbol, side, qty, reduce_only)
-        positions_cache.pop("positions", None)  # 포지션 캐시 무효화
-        return {"ok": True, "action": "open", "order": order}
+    # 최대 코인 수 제한: 신규 '오픈'일 때만 체크 (청산/추가 제외)
+    is_new_open = (held_side is None) and (reduce_only is False)
+    if is_new_open and len(open_symbols_cache) >= MAX_COINS:
+        logger.info(f"skip: MAX_COINS reached ({ccxt_symbol})")
+        return {"ok": True, "skip": "max_coins"}
 
-    # 2) 현재 포지션 있음 (long | short)
-    cur_side = (cur.get("side") or "").lower()
-    if cur_side not in ("long", "short"):
-        logger.info(f"skip: unknown current position side {cur_side}")
-        return {"ok": True, "skipped": "unknown_position"}
+    # 수량 산출
+    amount = 0.0
+    price_for_log = 0.0
 
-    # (a) 롱 보유 중
-    if cur_side == "long":
-        if tv_side == "buy":
-            # 물타기(증가)
-            side = "buy"
-            reduce_only = False
-        else:  # 'sell' -> 청산/감소
-            side = "sell"
-            reduce_only = True
+    if reduce_only:
+        # 청산일 때: TV가 주는 size가 있을 수도 있지만
+        # 안전하게 현재 포지션 수량(contracts) 이하로만 처리
+        try:
+            pos = await ex.fetch_position(ccxt_symbol)
+        except Exception:
+            pos = None
+
+        held_contracts = float((pos or {}).get("contracts", 0) or 0)
+        if held_contracts <= 0:
+            logger.info(f"skip: no position to reduce ({ccxt_symbol})")
+            return {"ok": True, "skip": "no_position_to_reduce"}
+
+        # TV size가 오면 그만큼만, 없으면 전량
+        req_size = float(alert.size or 0)
+        if req_size > 0:
+            amount = min(held_contracts, req_size)
+        else:
+            amount = held_contracts
+
+        amount = round_amount(market, amount)
+        if amount <= 0:
+            logger.info(f"skip: reduce size too small ({ccxt_symbol})")
+            return {"ok": True, "skip": "reduce_too_small"}
+
     else:
-        # (b) 숏 보유 중
-        if tv_side == "sell":
-            # 물타기(증가)
-            side = "sell"
-            reduce_only = False
-        else:  # 'buy' -> 청산/감소
-            side = "buy"
-            reduce_only = True
-
-    if qty <= 0:
-        logger.info(f"skip: calc amount is zero | {{'symbol': '{ccxt_symbol}', 'price': {price}}}")
-        return {"ok": True, "skipped": "zero_amount"}
+        # 신규/물타기 진입: 지갑의 1/20 마진 + 현재 레버리지에 맞춰 명목가 계산
+        amount, price_for_log = await calc_open_amount(ccxt_symbol, market)
+        if amount <= 0:
+            logger.info(f"skip: calc amount is zero | {{'symbol':'{ccxt_symbol}','price':{price_for_log}}}")
+            return {"ok": True, "skip": "amount_zero"}
 
     # 주문 실행
-    order = await place_order_bitget(ccxt_symbol, side, qty, reduce_only)
-    positions_cache.pop("positions", None)  # 포지션 캐시 무효화
+    try:
+        res = await place_order_bitget(ccxt_symbol, order_side, amount, reduce_only)
+        logger.info(f"ORDER OK | {ccxt_symbol} {order_side} {amount} reduceOnly={reduce_only} -> {res}")
 
-    elapsed = round(time.time() - started, 3)
-    return {
-        "ok": True,
-        "elapsed": elapsed,
-        "action": "add_or_close",
-        "tv": {"symbol": tv_symbol, "side": tv_side},
-        "mapped": ccxt_symbol,
-        "qty": qty,
-        "reduceOnly": reduce_only,
-        "order": order,
-    }
+        # 오픈심볼 캐시 갱신(대략적)
+        if reduce_only:
+            # 포지션이 모두 닫혔는지 확인 (남아있으면 유지)
+            try:
+                p = await ex.fetch_position(ccxt_symbol)
+                contracts_left = float(p.get("contracts", 0) or 0)
+                side_left = p.get("side")
+                if contracts_left > 0 and side_left in ("long", "short"):
+                    update_open_symbols(ccxt_symbol, side_left)
+                else:
+                    update_open_symbols(ccxt_symbol, None)
+            except Exception:
+                # 조회 실패시 보수적으로 삭제
+                update_open_symbols(ccxt_symbol, None)
+        else:
+            # 신규/추가 오픈 후 방향 기록
+            after_side = "long" if tv_side == "buy" else "short"
+            update_open_symbols(ccxt_symbol, after_side)
+
+        return {"ok": True, "executed": True}
+
+    except ccxt.BaseError as e:
+        # Bitget 공통 오류 로깅
+        msg = f"{type(e).__name__}: {str(e)}"
+        logger.error(f"order_failed: {msg}")
+        # 메시지 안에 Bitget status code 들어있는 경우가 많음
+        return {"ok": False, "error": msg}
+    except Exception as e:
+        logger.error(f"order_failed: {e}")
+        return {"ok": False, "error": str(e)}
 
 
-@app.get("/")
-async def root():
-    return {"ok": True, "service": "tv-bitget-router", "docs": "/docs"}
+# ----------------------------
+# Shutdown hook
+# ----------------------------
+@app.on_event("shutdown")
+async def _shutdown():
+    global ex
+    if ex is not None:
+        try:
+            await ex.close()
+        except Exception:
+            pass
