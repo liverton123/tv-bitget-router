@@ -1,170 +1,211 @@
-# app.py (FastAPI/Starlette 기준)
-import os, json, math
+import os
+import json
+import asyncio
+from typing import Any, Dict, Optional
+
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
-import ccxt.async_support as ccxt
 
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mySecret123!")  # 느낌표 포함 정확히
-PRODUCT_TYPE = "umcbl"  # Bitget USDT-M Perp
-DEFAULT_LEVERAGE = int(os.getenv("LEVERAGE", "10"))
+import ccxt.async_support as ccxt   # 반드시 async_support 사용
+from pydantic import BaseModel
 
-app = FastAPI()
+# =========================
+# 환경변수
+# =========================
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mySecret123!")  # TV 메시지의 "secret" 과 동일하게
+BITGET_API_KEY = os.getenv("BITGET_KEY")
+BITGET_API_SECRET = os.getenv("BITGET_SECRET")
+BITGET_API_PASSWORD = os.getenv("BITGET_PASSWORD")  # Bitget은 비밀번호 필수
 
-def tv_to_bitget_symbol(tv_ticker: str) -> str:
+if not (BITGET_API_KEY and BITGET_API_SECRET and BITGET_API_PASSWORD):
+    print("[WARN] BITGET API 환경변수가 비어있습니다. (BITGET_KEY/SECRET/PASSWORD)")
+
+# =========================
+# FastAPI
+# =========================
+app = FastAPI(title="tv-bitget-router", version="1.0.0")
+
+
+# =========================
+# 유틸: TV심볼 -> ccxt/Bitget 심볼
+#   TV:  ETHUSDT.P    (U본위 퍼프)
+#   ccxt: ETH/USDT:USDT  (Bitget UMCBL)
+# =========================
+def tv_to_ccxt_symbol(tv_symbol: str) -> str:
     """
-    TradingView의 `SUIUSDT.P`, `XRPUSDT.P` → ccxt 심볼 `SUI/USDT:USDT` 로 변환
-    (Bitget USDT-M perpetual의 ccxt 심볼 포맷)
+    TradingView 심볼(예: 'ETHUSDT.P')을 ccxt/Bitget 마켓 심볼('ETH/USDT:USDT')로 변환
     """
-    t = tv_ticker.upper().strip()
-    if t.endswith(".P"):
-        t = t[:-2]
-    # 현물처럼 보이나 선물로 강제
-    base_quote = t.replace("USDT", "/USDT")
-    # Bitget USDT-M Perp 는 ':USDT' 컨트랙트 식별자 필요
-    if "/USDT" in base_quote and not base_quote.endswith(":USDT"):
-        base_quote = base_quote + ":USDT"
-    return base_quote
+    if not tv_symbol:
+        raise ValueError("symbol empty")
 
-async def get_exchange():
-    ex = ccxt.bitget({
+    s = tv_symbol.upper().replace(".P", "")
+    # USDT 마켓만 운용한다고 가정
+    if not s.endswith("USDT"):
+        raise ValueError(f"Unsupported symbol format: {tv_symbol}")
+
+    base = s[:-4]  # 'ETH'
+    return f"{base}/USDT:USDT"  # ccxt의 Bitget U 본위 무기한 통합 심볼
+
+
+# =========================
+# Bitget (ccxt) 클라이언트
+# =========================
+def create_bitget():
+    exchange = ccxt.bitget({
+        "apiKey": BITGET_API_KEY,
+        "secret": BITGET_API_SECRET,
+        "password": BITGET_API_PASSWORD,
         "enableRateLimit": True,
+        # Bitget U본위 Perp에 필요한 파라미터
         "options": {
-            "defaultType": "swap",
-            "productType": PRODUCT_TYPE,  # 중요!
-        }
+            # 기본 productType 설정
+            "defaultType": "swap",             # ccxt 관용
+            "defaultMarginMode": "cross",
+            "defaultProductType": "umcbl",     # 커스텀 키 (params로 계속 넘겨줄 것)
+        },
     })
-    await ex.load_markets()
-    return ex
+    return exchange
 
-def to_reduce_only(side: str, have_pos_side: str) -> bool:
-    """
-    현재 보유 포지션 방향과 들어온 side로 reduceOnly 여부 결정.
-    - have_pos_side: 'long' | 'short' | 'flat'
-    """
-    if have_pos_side == "flat":
-        return False
-    if have_pos_side == "long" and side == "sell":
-        return True
-    if have_pos_side == "short" and side == "buy":
-        return True
-    return False
 
-async def get_position_side(ex, market):
-    """
-    Bitget에서 해당 심볼 포지션 가져와 long/short/flat 판별
-    """
+# =========================
+# 포지션 조회 (순포지션 수량)
+#  - Bitget는 dual/oneway 모두 지원. ccxt는 리스트 형태로 반환.
+#  - net 계약수(+)롱, (-)숏 추정
+# =========================
+async def fetch_net_contracts(ex: ccxt.Exchange, ccxt_symbol: str) -> float:
     try:
-        pos_list = await ex.fetch_positions([market["symbol"]], params={"productType": PRODUCT_TYPE})
-        long_sz = 0.0
-        short_sz = 0.0
-        for p in pos_list or []:
-            if p.get("contracts") and float(p["contracts"]) > 0:
-                if p.get("side") == "long":
-                    long_sz += float(p["contracts"])
-                elif p.get("side") == "short":
-                    short_sz += float(p["contracts"])
-        if long_sz > 0 and short_sz == 0:
-            return "long"
-        if short_sz > 0 and long_sz == 0:
-            return "short"
-        return "flat"
+        positions = await ex.fetch_positions([ccxt_symbol], params={"productType": "umcbl"})
     except Exception:
-        # 포지션 조회 실패 시엔 안전하게 flat로 취급하고 로그로만 남김
-        return "flat"
+        # 일부 ccxt 버전은 심볼 배열 미지원 → 전체 조회 후 필터
+        positions = await ex.fetch_positions(params={"productType": "umcbl"})
 
-def amount_to_precision(ex, market, amount_float):
-    prec = market.get("precision", {}).get("amount")
-    if prec is None:
-        return ex.amount_to_precision(market["symbol"], amount_float)
-    step = 10 ** (-prec)
-    return math.floor(amount_float / step) * step
+    net = 0.0
+    for p in positions:
+        if p.get("symbol") != ccxt_symbol:
+            continue
+        # ccxt 표준 필드
+        side = (p.get("side") or "").lower()  # "long" | "short" | ""
+        contracts = float(p.get("contracts") or 0) or float(p.get("amount") or 0)
+        if side == "long":
+            net += contracts
+        elif side == "short":
+            net -= contracts
+        else:
+            # 일부 브로커는 sign 가 amount에 반영될 수도 있음
+            net += float(p.get("positionAmt") or 0)
+    return float(net)
 
+
+# =========================
+# 주문 헬퍼
+#  - buy: 증액(물타기 포함)
+#  - sell: reduceOnly (롱 청산 전용) → 순포지션 없으면 "무시"
+# =========================
+async def place_order(
+    ex: ccxt.Exchange,
+    ccxt_symbol: str,
+    side: str,                 # 'buy' | 'sell'
+    order_type: str,           # 'market' 권장
+    size: float,
+) -> Dict[str, Any]:
+
+    side = side.lower()
+    order_type = order_type.lower()
+
+    if order_type not in ("market", "limit"):
+        raise ValueError("orderType must be 'market' or 'limit'")
+
+    # 롱-전용 전략: SELL은 reduceOnly로만; 포지션 없으면 무시
+    if side == "sell":
+        net = await fetch_net_contracts(ex, ccxt_symbol)
+        if net <= 0:
+            return {
+                "status": "ignored",
+                "reason": "no long position to reduce",
+                "symbol": ccxt_symbol,
+                "requested_size": size,
+                "net_before": net,
+            }
+        reduce_size = min(size, net)  # 남은 수량보다 많이 던지지 않기
+        params = {"reduceOnly": True, "productType": "umcbl"}
+        order = await ex.create_order(ccxt_symbol, order_type, side, reduce_size, None, params)
+        net_after = await fetch_net_contracts(ex, ccxt_symbol)
+        return {"status": "ok", "order": order, "net_before": net, "net_after": net_after}
+
+    elif side == "buy":
+        # 롱 증액(진입/물타기)
+        params = {"productType": "umcbl"}
+        order = await ex.create_order(ccxt_symbol, order_type, side, size, None, params)
+        net_after = await fetch_net_contracts(ex, ccxt_symbol)
+        return {"status": "ok", "order": order, "net_after": net_after}
+
+    else:
+        raise ValueError("side must be 'buy' or 'sell'")
+
+
+# =========================
+# 요청 스키마
+# =========================
+class TVPayload(BaseModel):
+    secret: str
+    symbol: str        # ex) "ETHUSDT.P"
+    side: str          # "buy" | "sell"
+    orderType: str     # "market"
+    size: float        # 수량 (예: 0.034)
+
+
+# =========================
+# 웹훅 엔드포인트
+# =========================
 @app.post("/webhook")
 async def webhook(req: Request):
     try:
-        body = await req.json()
+        data = await req.json()
     except Exception:
-        return JSONResponse({"ok": False, "err": "invalid_json"}, status_code=200)
-
-    # 1) 시크릿 확인
-    try:
-        if body.get("secret") != WEBHOOK_SECRET:
-            return JSONResponse({"ok": False, "err": "bad_secret"}, status_code=200)
-    except Exception:
-        return JSONResponse({"ok": False, "err": "no_secret"}, status_code=200)
-
-    # 2) 필드 추출
-    raw_symbol = (body.get("symbol") or "").strip()
-    side      = (body.get("side") or "").strip().lower()   # buy/sell
-    otype     = (body.get("orderType") or "market").strip().lower()
-    size_raw  = body.get("size")
-
-    if not raw_symbol or side not in ("buy","sell") or not size_raw:
-        return JSONResponse({"ok": False, "err": "missing_fields"}, status_code=200)
-
-    tv_symbol = raw_symbol
-    ccxt_symbol = tv_to_bitget_symbol(tv_symbol)
-
-    ex = None
-    try:
-        ex = await get_exchange()
-
-        # 3) 심볼/상장 확인
-        if ccxt_symbol not in ex.markets:
-            # 상장 안 됨 → 200으로 응답, 로그만 남김
-            app.logger.info(f"UNSUPPORTED_SYMBOL tv={tv_symbol} ccxt={ccxt_symbol}")
-            return JSONResponse({"ok": False, "err": "unsupported_symbol", "symbol": tv_symbol}, status_code=200)
-
-        market = ex.markets[ccxt_symbol]
-
-        # 4) 수량 정규화 (TradingView는 '코인 수량'을 보냄)
+        # TV에서 text로 보내는 경우 대비
+        raw = await req.body()
         try:
-            amount = float(size_raw)
+            data = json.loads(raw.decode())
         except Exception:
-            return JSONResponse({"ok": False, "err": "bad_size"}, status_code=200)
+            raise HTTPException(status_code=400, detail="invalid json")
 
-        amount = amount_to_precision(ex, market, amount)
-        if amount <= 0:
-            return JSONResponse({"ok": False, "err": "zero_amount"}, status_code=200)
-
-        # 5) 레버리지 설정(최초 1회만 성공해도 OK, 실패해도 주문은 진행)
-        try:
-            await ex.set_leverage(DEFAULT_LEVERAGE, market["symbol"], params={"productType": PRODUCT_TYPE})
-        except Exception as e:
-            app.logger.info(f"set_leverage_fail {market['symbol']} {e}")
-
-        # 6) 포지션 방향 파악 & reduceOnly 결정
-        have_side = await get_position_side(ex, market)
-        reduce_only = to_reduce_only(side, have_side)
-
-        # 7) 주문 생성
-        params = {"productType": PRODUCT_TYPE, "reduceOnly": reduce_only}
-        order = await ex.create_order(market["symbol"], otype, side, amount, None, params)
-
-        return JSONResponse({
-            "ok": True,
-            "symbol": tv_symbol,
-            "ccxt_symbol": market["symbol"],
-            "side": side,
-            "reduceOnly": reduce_only,
-            "amount": amount,
-            "orderId": order.get("id"),
-        }, status_code=200)
-
+    # 유효성 검사
+    try:
+        p = TVPayload(**data)
     except Exception as e:
-        # 모든 예외는 200으로 소비 + 상세 로그
+        raise HTTPException(status_code=400, detail=f"payload error: {e}")
+
+    if p.secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    # 심볼 변환
+    try:
+        ccxt_symbol = tv_to_ccxt_symbol(p.symbol)  # "ETH/USDT:USDT"
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"symbol convert error: {e}")
+
+    ex = create_bitget()
+    try:
+        result = await place_order(
+            ex=ex,
+            ccxt_symbol=ccxt_symbol,
+            side=p.side,
+            order_type=p.orderType,
+            size=float(p.size),
+        )
+        return JSONResponse({"ok": True, "result": result})
+    except ccxt.BaseError as e:
+        # Bitget/ccxt 에러 메시지 그대로 노출 + productType 보장
+        raise HTTPException(status_code=500, detail=f"ccxt error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"server error: {repr(e)}")
+    finally:
         try:
-            app.logger.error(f"order_fail tv={tv_symbol} ccxt={ccxt_symbol} side={side} size={size_raw} err={repr(e)}")
+            await ex.close()
         except Exception:
             pass
-        return JSONResponse({"ok": False, "err": "exception", "msg": str(e)}, status_code=200)
-    finally:
-        if ex:
-            try:
-                await ex.close()
-            except Exception:
-                pass
 
-@app.get("/health")
+
+@app.get("/")
 async def health():
-    return {"ok": True}
+    return {"status": "ok"}
