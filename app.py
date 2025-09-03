@@ -8,14 +8,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ====== ENV ======
 WEBHOOK_SECRET      = os.getenv("WEBHOOK_SECRET", "")
 BITGET_API_KEY      = os.getenv("BITGET_API_KEY", "")
 BITGET_API_SECRET   = os.getenv("BITGET_API_SECRET", "")
 BITGET_API_PASSWORD = os.getenv("BITGET_API_PASSWORD", "")
 
-# 시드의 1/20 진입 (레버리지는 거래소 UI에서 지정)
-FRACTION_PER_POSITION = float(os.getenv("FRACTION_PER_POSITION", "0.05"))
+# 포지션 사이징
+USE_FIXED_MARGIN        = os.getenv("USE_FIXED_MARGIN", "true").lower() == "true"
+MARGIN_PER_TRADE_USDT   = float(os.getenv("MARGIN_PER_TRADE_USDT", "6"))   # 마진 6달러
+UI_LEVERAGE             = float(os.getenv("UI_LEVERAGE", "10"))            # UI에서 설정한 레버리지값
+FRACTION_PER_POSITION   = float(os.getenv("FRACTION_PER_POSITION", "0.05"))# 백업: 시드 1/20
 
+# 거래 설정
 ALLOW_SHORTS  = os.getenv("ALLOW_SHORTS", "true").lower() == "true"
 PRODUCT_TYPE  = os.getenv("BITGET_PRODUCT_TYPE", "UMCBL").upper()  # USDT-M Perp
 MARGIN_COIN   = os.getenv("BITGET_MARGIN_COIN", "USDT").upper()
@@ -26,7 +31,7 @@ log = logging.getLogger("tv-bitget-router")
 
 app = FastAPI()
 
-# --------------------- helpers ---------------------
+# ====== helpers ======
 def tv_to_ccxt_symbol(tv_symbol: str) -> str:
     s = tv_symbol.strip().upper()
     if s.endswith(".P"):
@@ -83,41 +88,35 @@ def is_prodtype_error(e: Exception) -> bool:
     msg = getattr(e, "message", "") or str(e)
     return "40019" in msg or "40020" in msg or "productType" in msg
 
-# ---- 포지션 조회: 다계단 리트라이 + Raw 엔드포인트 백업 ----
+# ---- 포지션 조회(다계단 + RAW 백업) ----
 async def fetch_positions_all(ex: ccxt.Exchange) -> List[Dict[str, Any]]:
-    # 1) 정상 경로
     try:
         return await ex.fetch_positions(None, params={"productType": PRODUCT_TYPE})
     except Exception as e1:
         if not is_prodtype_error(e1):
             raise
-        log.warning("positions step1 failed (%s) -> retry step2", e1)
+        log.warning("positions step1 failed (%s) -> step2", e1)
 
-    # 2) productType + marginCoin
     try:
         return await ex.fetch_positions(None, params={"productType": PRODUCT_TYPE, "marginCoin": MARGIN_COIN})
     except Exception as e2:
         if not is_prodtype_error(e2):
             raise
-        log.warning("positions step2 failed (%s) -> retry step3", e2)
+        log.warning("positions step2 failed (%s) -> step3", e2)
 
-    # 3) marginCoin only
     try:
         return await ex.fetch_positions(None, params={"marginCoin": MARGIN_COIN})
     except Exception as e3:
         if not is_prodtype_error(e3):
             raise
-        log.warning("positions step3 failed (%s) -> retry RAW", e3)
+        log.warning("positions step3 failed (%s) -> RAW", e3)
 
-    # 4) Raw (ccxt 프라이빗 메서드 직접)
     try:
-        # async_support 네이밍
         res = await ex.privateMixGetV2MixPositionAllPosition({
             "productType": PRODUCT_TYPE,
             "marginCoin": MARGIN_COIN,
         })
         data = (res or {}).get("data") or []
-        # ccxt 표준 포맷에 맞춰 최소 필드만 매핑
         out = []
         for it in data:
             try:
@@ -129,8 +128,7 @@ async def fetch_positions_all(ex: ccxt.Exchange) -> List[Dict[str, Any]]:
             out.append({"symbol": sym, "side": side, "contracts": contracts, "info": it})
         return out
     except Exception as e4:
-        # 최종 실패: 순포지션 0으로 간주하게 빈 리스트 리턴 (웹훅 실패 방지)
-        log.error("positions RAW failed as well (%s) -> assume empty positions", e4)
+        log.error("positions RAW failed (%s) -> assume empty", e4)
         return []
 
 async def fetch_net_position(ex: ccxt.Exchange, ccxt_symbol: str) -> float:
@@ -178,22 +176,24 @@ async def place_market_order(
         params["reduceOnly"] = True
     return await ex.create_order(ccxt_symbol, "market", side, amount, None, params)
 
-# -------------------- models -----------------------
+# ====== models ======
 class TVAlert(BaseModel):
     secret: str = Field(default="")
     symbol: str
     side: str               # "buy" | "sell"
     orderType: str = "market"
     size: float | None = None
+    dca: bool | None = None  # 물타기 신호 여부(선택)
 
-# -------------------- routes -----------------------
+# ====== routes ======
 @app.get("/")
 async def root():
     return {"ok": True}
 
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "productType": PRODUCT_TYPE, "marginCoin": MARGIN_COIN}
+    return {"ok": True, "productType": PRODUCT_TYPE, "marginCoin": MARGIN_COIN,
+            "useFixedMargin": USE_FIXED_MARGIN, "marginUSDT": MARGIN_PER_TRADE_USDT, "uiLeverage": UI_LEVERAGE}
 
 @app.post("/webhook")
 async def webhook(req: Request):
@@ -225,18 +225,31 @@ async def webhook(req: Request):
     try:
         await ensure_markets(ex)
 
+        # 현재 순포지션
         net = await fetch_net_position(ex, ccxt_symbol)
 
+        # DCA 신호면: 순포지션 없으면 스킵
+        if (msg.dca is True) and abs(net) < 1e-12:
+            log.info("DCA skip: no existing position | %s", ccxt_symbol)
+            return {"ok": True, "skip": "dca_no_position", "symbol": msg.symbol}
+
+        # reduceOnly 판정(반대 방향이면 감산)
         is_reduce_only = (side == "buy" and net < -1e-12) or (side == "sell" and net > 1e-12)
 
-        equity = await fetch_equity_usdt(ex)
+        # 사이징
         market, price = await fetch_market_and_price(ex, ccxt_symbol)
-        notional = equity * FRACTION_PER_POSITION
-        raw_amount = max(notional / price, 0.0)
-        amount = apply_limits(raw_amount, price, market)
 
+        if USE_FIXED_MARGIN:
+            # 목표 마진(USDT) → 명목치 = 마진 * UI레버리지 → 수량
+            target_notional = MARGIN_PER_TRADE_USDT * UI_LEVERAGE
+            raw_amount = max(target_notional / price, 0.0)
+        else:
+            equity = await fetch_equity_usdt(ex)
+            target_notional = equity * FRACTION_PER_POSITION
+            raw_amount = max(target_notional / price, 0.0)
+
+        amount = apply_limits(raw_amount, price, market)
         if amount <= 0:
-            log.info("skip: amount=0 | sym=%s price=%.10f notional=%.4f", ccxt_symbol, price, notional)
             return {"ok": True, "skip": "amount_zero", "symbol": msg.symbol}
 
         plan = {
@@ -244,10 +257,13 @@ async def webhook(req: Request):
             "symbol": ccxt_symbol,
             "side": side,
             "reduceOnly": is_reduce_only,
-            "equity": equity,
             "price": price,
-            "notional": notional,
+            "target_notional": target_notional,
             "amount": amount,
+            "dca": bool(msg.dca),
+            "useFixedMargin": USE_FIXED_MARGIN,
+            "uiLeverage": UI_LEVERAGE,
+            "marginUSDT": MARGIN_PER_TRADE_USDT,
         }
         log.info("plan: %s", json.dumps(plan, ensure_ascii=False))
 
@@ -257,7 +273,6 @@ async def webhook(req: Request):
         return {"ok": True, "order": order, "plan": plan}
 
     except ccxt.BaseError as e:
-        # 40019/40020는 이미 내부에서 처리했으므로, 남은 건 진짜 거래소 장애
         log.exception("exchange_error")
         raise HTTPException(status_code=500, detail=f"exchange_error: {getattr(e, 'message', str(e))}")
     except Exception as e:
