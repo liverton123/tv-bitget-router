@@ -18,6 +18,7 @@ FRACTION_PER_POSITION = float(os.getenv("FRACTION_PER_POSITION", "0.05"))
 
 ALLOW_SHORTS  = os.getenv("ALLOW_SHORTS", "true").lower() == "true"
 PRODUCT_TYPE  = os.getenv("BITGET_PRODUCT_TYPE", "UMCBL").upper()  # USDT-M Perp
+MARGIN_COIN   = os.getenv("BITGET_MARGIN_COIN", "USDT").upper()
 LOG_LEVEL     = os.getenv("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -28,7 +29,7 @@ app = FastAPI()
 # --------------------- helpers ---------------------
 def tv_to_ccxt_symbol(tv_symbol: str) -> str:
     s = tv_symbol.strip().upper()
-    if s.endswith(".P"):  # TradingView 퍼페츄얼 접미사 제거
+    if s.endswith(".P"):
         s = s[:-2]
     if not s.endswith("USDT"):
         raise ValueError(f"USDT 기준 심볼만 지원: {tv_symbol}")
@@ -53,7 +54,7 @@ def build_exchange() -> ccxt.bitget:
         "secret": BITGET_API_SECRET,
         "password": BITGET_API_PASSWORD,
         "enableRateLimit": True,
-        "options": {"defaultType": "swap"},   # USDT-M
+        "options": {"defaultType": "swap"},
     })
 
 async def ensure_markets(ex: ccxt.Exchange):
@@ -63,7 +64,6 @@ async def ensure_markets(ex: ccxt.Exchange):
         await ex.load_markets(reload=True)
 
 async def fetch_equity_usdt(ex: ccxt.Exchange) -> float:
-    # balance()에는 productType 절대 넣지 말 것 (40019/40020 방지)
     bal = await ex.fetch_balance({"type": "swap"})
     usdt = bal.get("USDT") or {}
     total = f2(usdt.get("total"))
@@ -79,9 +79,59 @@ async def fetch_market_and_price(ex: ccxt.Exchange, ccxt_symbol: str) -> Tuple[D
         raise RuntimeError(f"가격 조회 실패: {ccxt_symbol}")
     return market, price
 
-# ---- ★ 핵심 패치: 전체 포지션으로 조회(None) 후 필터 ★
+def is_prodtype_error(e: Exception) -> bool:
+    msg = getattr(e, "message", "") or str(e)
+    return "40019" in msg or "40020" in msg or "productType" in msg
+
+# ---- 포지션 조회: 다계단 리트라이 + Raw 엔드포인트 백업 ----
 async def fetch_positions_all(ex: ccxt.Exchange) -> List[Dict[str, Any]]:
-    return await ex.fetch_positions(None, params={"productType": PRODUCT_TYPE})
+    # 1) 정상 경로
+    try:
+        return await ex.fetch_positions(None, params={"productType": PRODUCT_TYPE})
+    except Exception as e1:
+        if not is_prodtype_error(e1):
+            raise
+        log.warning("positions step1 failed (%s) -> retry step2", e1)
+
+    # 2) productType + marginCoin
+    try:
+        return await ex.fetch_positions(None, params={"productType": PRODUCT_TYPE, "marginCoin": MARGIN_COIN})
+    except Exception as e2:
+        if not is_prodtype_error(e2):
+            raise
+        log.warning("positions step2 failed (%s) -> retry step3", e2)
+
+    # 3) marginCoin only
+    try:
+        return await ex.fetch_positions(None, params={"marginCoin": MARGIN_COIN})
+    except Exception as e3:
+        if not is_prodtype_error(e3):
+            raise
+        log.warning("positions step3 failed (%s) -> retry RAW", e3)
+
+    # 4) Raw (ccxt 프라이빗 메서드 직접)
+    try:
+        # async_support 네이밍
+        res = await ex.privateMixGetV2MixPositionAllPosition({
+            "productType": PRODUCT_TYPE,
+            "marginCoin": MARGIN_COIN,
+        })
+        data = (res or {}).get("data") or []
+        # ccxt 표준 포맷에 맞춰 최소 필드만 매핑
+        out = []
+        for it in data:
+            try:
+                sym = ex.safe_symbol(f"{it.get('symbol')}/USDT:USDT", market=None)
+            except Exception:
+                sym = f"{(it.get('symbol') or '').upper()}/USDT:USDT"
+            side = (it.get("holdSide") or "").lower()  # long/short
+            contracts = f2(it.get("total"))
+            out.append({"symbol": sym, "side": side, "contracts": contracts, "info": it})
+        return out
+    except Exception as e4:
+        # 최종 실패: 순포지션 0으로 간주하게 빈 리스트 리턴 (웹훅 실패 방지)
+        log.error("positions RAW failed as well (%s) -> assume empty positions", e4)
+        return []
 
 async def fetch_net_position(ex: ccxt.Exchange, ccxt_symbol: str) -> float:
     pos_list = await fetch_positions_all(ex)
@@ -143,7 +193,7 @@ async def root():
 
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "productType": PRODUCT_TYPE}
+    return {"ok": True, "productType": PRODUCT_TYPE, "marginCoin": MARGIN_COIN}
 
 @app.post("/webhook")
 async def webhook(req: Request):
@@ -175,13 +225,10 @@ async def webhook(req: Request):
     try:
         await ensure_markets(ex)
 
-        # 현재 보유 수량(순수량)
         net = await fetch_net_position(ex, ccxt_symbol)
 
-        # 반대방향이면 reduceOnly, 동일방향이면 진입/물타기
         is_reduce_only = (side == "buy" and net < -1e-12) or (side == "sell" and net > 1e-12)
 
-        # 시드 * 1/20 / 가격  => 수량
         equity = await fetch_equity_usdt(ex)
         market, price = await fetch_market_and_price(ex, ccxt_symbol)
         notional = equity * FRACTION_PER_POSITION
@@ -210,6 +257,7 @@ async def webhook(req: Request):
         return {"ok": True, "order": order, "plan": plan}
 
     except ccxt.BaseError as e:
+        # 40019/40020는 이미 내부에서 처리했으므로, 남은 건 진짜 거래소 장애
         log.exception("exchange_error")
         raise HTTPException(status_code=500, detail=f"exchange_error: {getattr(e, 'message', str(e))}")
     except Exception as e:
