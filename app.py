@@ -1,256 +1,260 @@
-import os, json, asyncio, math
-from collections import defaultdict
-from typing import Optional, Dict, Any, List, Tuple
+import os
+import re
+import json
+import asyncio
+from typing import Optional, Literal, Dict, Any
 
-import ccxt.async_support as ccxt
-from cachetools import TTLCache
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, HTTPException
-
 load_dotenv()
 
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-PRODUCT_TYPE = os.getenv("PRODUCT_TYPE", "umcbl")  # bitget USDT-M perpetual
-CLOSE_TOLERANCE_PCT = float(os.getenv("CLOSE_TOLERANCE_PCT", "0.02"))
+from fastapi import FastAPI, Request, HTTPException
+from pydantic import BaseModel, field_validator
+import ccxt.async_support as ccxt
 
-app = FastAPI()
-ex: ccxt.bitget = None  # type: ignore
+# -----------------------------
+# 환경 설정
+# -----------------------------
+PRODUCT_TYPE = os.getenv("PRODUCT_TYPE", "umcbl").strip().lower()  # <- 소문자 강제
+MARGIN_MODE  = os.getenv("MARGIN_MODE", "cross").strip().lower()
+DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "10"))
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-# --- 간단 캐시/락 ---
-market_cache = TTLCache(maxsize=512, ttl=60)
-price_cache  = TTLCache(maxsize=1024, ttl=5)
-locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+if PRODUCT_TYPE not in {"umcbl", "dmcbl"}:
+    # umcbl: USDT-M perpetual, dmcbl: Coin-M perpetual (필요시 추가)
+    raise RuntimeError(f"Unsupported PRODUCT_TYPE: {PRODUCT_TYPE}")
 
+# -----------------------------
+# Pydantic 모델
+# -----------------------------
+class TVPayload(BaseModel):
+    secret: str
+    symbol: str               # e.g., ENAUSDT.P
+    side: Literal["buy", "sell"]
+    orderType: Literal["market", "limit"]
+    size: float
+    price: Optional[float] = None
 
-# ---------- 유틸 ----------
-def tv_to_ccxt_symbol(tv_symbol: str) -> str:
-    """
-    TradingView 심볼 -> CCXT 심볼
-    예: 'ENAUSDT.P' / 'ENAUSDT' -> 'ENA/USDT:USDT'
-    """
-    s = tv_symbol.upper().replace(".P", "").replace("PERP", "").replace("-PERP", "")
-    if not s.endswith("USDT"):
-        raise ValueError(f"unsupported symbol: {tv_symbol}")
-    base = s[:-4]
-    return f"{base}/USDT:USDT"
+    @field_validator("symbol")
+    def normalize_symbol(cls, v: str) -> str:
+        # TradingView 심볼 (예: ENAUSDT.P) → CCXT 심볼 (예: ENA/USDT:USDT or ENA/USDT)
+        # Bitget USDT-M 퍼펫은 일반적으로 ENA/USDT
+        s = v.strip().upper()
+        # 뒤에 '.P' 붙는 건 제거
+        s = re.sub(r"\.P$", "", s)
+        # XXXUSDT → XXX/USDT
+        if s.endswith("USDT"):
+            base = s[:-4]
+            quote = "USDT"
+            return f"{base}/{quote}"
+        return s
 
-def is_close_intent(req_amount: Optional[float], pos_abs: float,
-                    lot_step: float, tol_pct: float) -> bool:
-    if pos_abs <= 0:
-        return False
-    if req_amount is None:
-        # 수량이 명시 안 됐고 반대방향이면 '청산 의도'로 본다(전량)
-        return True
-    abs_tol = max(lot_step, pos_abs * tol_pct)
-    return abs(req_amount - pos_abs) <= abs_tol
+# -----------------------------
+# FastAPI
+# -----------------------------
+app = FastAPI(title="tv-bitget-router")
 
-def round_down(value: float, step: float) -> float:
-    if step <= 0:
-        return value
-    return math.floor(value / step) * step
+# -----------------------------
+# 거래소 인스턴스 (재사용)
+# -----------------------------
+_ex_lock = asyncio.Lock()
+_ex: Optional[ccxt.bitget] = None
 
+async def get_exchange() -> ccxt.bitget:
+    global _ex
+    async with _ex_lock:
+        if _ex is None:
+            _ex = ccxt.bitget({
+                "apiKey": os.getenv("BITGET_API_KEY"),
+                "secret": os.getenv("BITGET_API_SECRET"),
+                "password": os.getenv("BITGET_API_PASSPHRASE"),
+                "enableRateLimit": True,
+                "options": {
+                    "defaultType": "swap",  # 선물/스왑
+                    "defaultMarginMode": MARGIN_MODE,
+                    "defaultProductType": PRODUCT_TYPE,
+                },
+            })
+            await _ex.load_markets()
+        return _ex
 
-# ---------- 거래소 초기화 ----------
-@app.on_event("startup")
-async def startup():
-    global ex
-    ex = ccxt.bitget({
-        "apiKey": os.getenv("BITGET_API_KEY"),
-        "secret": os.getenv("BITGET_API_SECRET"),
-        "password": os.getenv("BITGET_API_PASSWORD"),
-        "enableRateLimit": True,
-        "options": {
-            # ccxt가 bitget 선물에서 productType 넘기도록 강제
-            "defaultType": "swap",
-        },
-    })
-    await ex.load_markets()
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    if ex:
-        await ex.close()
-
-
-# ---------- 마켓/시세/포지션 ----------
-async def fetch_market(symbol: str) -> Dict[str, Any]:
-    if symbol in market_cache:
-        return market_cache[symbol]
+# -----------------------------
+# 유틸: 심볼의 정밀도/시장정보
+# -----------------------------
+async def get_market_info(ex: ccxt.bitget, symbol: str) -> Dict[str, Any]:
+    if symbol not in ex.markets:
+        await ex.load_markets()
     market = ex.market(symbol)
-    market_cache[symbol] = market
     return market
 
-async def fetch_price(symbol: str) -> float:
-    if symbol in price_cache:
-        return price_cache[symbol]
-    t = await ex.fetch_ticker(symbol)
-    price = float(t["last"] or t["close"] or t["bid"] or t["ask"])
-    price_cache[symbol] = price
-    return price
+def amount_to_precision(ex: ccxt.bitget, symbol: str, amount: float) -> float:
+    return float(ex.amount_to_precision(symbol, amount))
 
-async def fetch_positions(symbols: List[str]) -> List[Dict[str, Any]]:
-    return await ex.fetch_positions(symbols, params={"productType": PRODUCT_TYPE})
+def price_to_precision(ex: ccxt.bitget, symbol: str, price: float) -> float:
+    return float(ex.price_to_precision(symbol, price))
 
-async def fetch_net_position(symbol: str) -> Tuple[float, float]:
-    """
-    리턴: (net_amount, abs_amount)  - +롱 / -숏 (계약수량=기초자산 수량)
-    """
-    pos_list = await fetch_positions([symbol])
-    net = 0.0
+# -----------------------------
+# 유틸: 레버리지/마진모드 보장
+# -----------------------------
+async def ensure_leverage_and_margin(ex: ccxt.bitget, symbol: str):
+    try:
+        # set_margin_mode 필요시:
+        await ex.set_margin_mode(MARGIN_MODE, symbol, params={"productType": PRODUCT_TYPE})
+    except Exception:
+        # 일부 거래소/시장 조합에서 불필요하거나 권한 제약 가능 → 무시
+        pass
+
+    try:
+        await ex.set_leverage(
+            DEFAULT_LEVERAGE,
+            symbol,
+            params={"productType": PRODUCT_TYPE, "marginMode": MARGIN_MODE},
+        )
+    except Exception:
+        # 이미 설정되어 있거나 코인 특성상 실패할 수 있으니 무시
+        pass
+
+# -----------------------------
+# 유틸: 현재 순포지션(net) 조회
+#   반환: (net_qty, entry_price)
+#   net_qty > 0 → 롱, net_qty < 0 → 숏, 0 → 무포지션
+# -----------------------------
+async def fetch_net_position(ex: ccxt.bitget, symbol: str) -> tuple[float, Optional[float]]:
+    # Bitget의 fetch_positions는 symbols 리스트 또는 None
+    pos_list = await ex.fetch_positions([symbol], params={"productType": PRODUCT_TYPE})
+    net_qty = 0.0
+    entry_price = None
+
     for p in pos_list:
         if p.get("symbol") != symbol:
             continue
-        side = str(p.get("side") or "").lower()  # long/short
-        contracts = float(p.get("contracts") or p.get("contractSize") or 0.0)
-        # 일부 ccxt 버전에선 p["contracts"]가 0이고 p["size"]가 있을 수 있음
-        if contracts <= 0 and p.get("size") is not None:
-            contracts = float(p["size"])
+        # Bitget은 long / short 각각 포지션을 반환할 수 있다.
+        side = p.get("side")  # 'long' or 'short'
+        size = float(p.get("contracts") or p.get("contractsSize") or p.get("positionAmt") or 0)
+        # ccxt 통일 필드
+        amt = float(p.get("contracts") or p.get("amount") or 0)
+
         if side == "long":
-            net += contracts
+            net_qty += amt
+            if not entry_price and p.get("entryPrice"):
+                entry_price = float(p["entryPrice"])
         elif side == "short":
-            net -= contracts
-    return net, abs(net)
+            net_qty -= amt
+            if not entry_price and p.get("entryPrice"):
+                entry_price = float(p["entryPrice"])
 
+    return net_qty, entry_price
 
-# ---------- 수량 결정 ----------
-async def decide_amount(symbol: str, msg: Dict[str, Any]) -> Tuple[float, float, float, float, str]:
-    """
-    size 해석:
-      - msg.size가 없으면 '가능한 기본 로직'(예: 일정 USDT)을 쓰고 싶다면 여기서 구현.
-      - 기본은 msg.size를 '기초자산 수량'으로 해석. msg.sizeIn == "quote"면 USDT->base 변환.
-    리턴: (amount_final, amount_req, price, lot_step, sizing_mode)
-    """
-    market = await fetch_market(symbol)
-    price = await fetch_price(symbol)
-    lot_step = float(
-        market.get("amount_increment") or
-        (market.get("precision") or {}).get("amount") or
-        market.get("lot") or 0.0
+# -----------------------------
+# 핵심: 안전주문 라우터
+# - opposite(반대) 방향 주문은 기본적으로 reduceOnly로 처리
+# - 무포지션일 때 reduceOnly 주문은 거래소가 거절 → "평가종료 신호가 신규진입" 문제 방지
+# -----------------------------
+async def route_order(ex: ccxt.bitget, symbol: str, side: str, order_type: str,
+                      size: float, price: Optional[float]) -> Dict[str, Any]:
+
+    await ensure_leverage_and_margin(ex, symbol)
+    market = await get_market_info(ex, symbol)
+
+    # 수량/가격 정밀도 보정
+    size = amount_to_precision(ex, symbol, float(size))
+    if price is not None:
+        price = price_to_precision(ex, symbol, float(price))
+
+    # 현재 net 포지션
+    net_qty, _ = await fetch_net_position(ex, symbol)
+
+    # 현재 방향
+    cur_dir = "long" if net_qty > 0 else "short" if net_qty < 0 else "flat"
+
+    params = {
+        "productType": PRODUCT_TYPE,
+        "marginMode": MARGIN_MODE,
+        "leverage": str(DEFAULT_LEVERAGE),
+    }
+
+    # 1) 평감지: 현재 롱인데 sell이 들어오면 reduceOnly
+    #           현재 숏인데 buy가 들어오면 reduceOnly
+    #           무포지션(flat)인데 reduceOnly면 자동 거절 => 신규 진입 방지
+    reduce_only = False
+    if cur_dir == "long" and side == "sell":
+        reduce_only = True
+    elif cur_dir == "short" and side == "buy":
+        reduce_only = True
+
+    if reduce_only:
+        params["reduceOnly"] = True
+
+    # 2) 주문 실행
+    order = await ex.create_order(
+        symbol=symbol,
+        type=order_type,
+        side=side,
+        amount=size,
+        price=price,
+        params=params
     )
-
-    req = msg.get("size")
-    sizing_mode = "msg_base"
-    if req is None:
-        raise HTTPException(400, "size missing")
-    req = float(req)
-
-    if str(msg.get("sizeIn") or "").lower() in ("quote", "usd", "usdt"):
-        # USDT 금액을 보냈다면 기초자산 수량으로 환산
-        sizing_mode = "msg_quote"
-        base = req / price
-    else:
-        base = req
-
-    # 거래소 최소증분 맞춤
-    if lot_step and lot_step > 0:
-        base = round_down(base, lot_step)
-
-    if base <= 0:
-        raise HTTPException(400, "amount computed as zero")
-
-    return base, float(req), float(price), float(lot_step), sizing_mode
-
-
-# ---------- 주문 ----------
-async def place_market(symbol: str, side: str, amount: float, reduce_only: bool) -> Dict[str, Any]:
-    params = {"reduceOnly": reduce_only, "productType": PRODUCT_TYPE}
-    order = await ex.create_order(symbol=symbol, type="market",
-                                  side=side, amount=amount, params=params)
     return order
 
-
-# ---------- 라우팅 로직 (핵심) ----------
+# -----------------------------
+# Webhook
+# -----------------------------
 @app.post("/webhook")
-async def webhook(request: Request):
-    body = await request.json()
-    # 1) 인증
-    if WEBHOOK_SECRET and body.get("secret") != WEBHOOK_SECRET:
-        raise HTTPException(401, "bad secret")
-
-    raw_symbol = body.get("symbol") or body.get("ticker") or ""
-    if not raw_symbol:
-        raise HTTPException(400, "symbol missing")
+async def webhook(req: Request):
+    try:
+        payload_raw = await req.body()
+        data = json.loads(payload_raw.decode("utf-8"))
+    except Exception:
+        raise HTTPException(400, "invalid json")
 
     try:
-        symbol = tv_to_ccxt_symbol(raw_symbol)
+        tv = TVPayload(**data)
     except Exception as e:
-        raise HTTPException(400, f"bad symbol: {raw_symbol}") from e
+        raise HTTPException(400, f"bad payload: {e}")
 
-    side = str(body.get("side") or "").lower()  # 'buy' or 'sell'
-    if side not in ("buy", "sell"):
-        raise HTTPException(400, "side must be buy/sell")
+    if not WEBHOOK_SECRET or tv.secret != WEBHOOK_SECRET:
+        raise HTTPException(401, "unauthorized")
 
-    # 동시 신호 대비 심볼별 락
-    async with locks[symbol]:
-        # 현재 포지션
-        net, net_abs = await fetch_net_position(symbol)
-        pos_side = "long" if net > 0 else ("short" if net < 0 else "flat")
+    ex = await get_exchange()
 
-        # 요청 수량 계산(기초자산)
-        amount_final, amount_req, price, lot_step, sizing_mode = await decide_amount(symbol, body)
+    # 심볼 변환 결과 (예: ENA/USDT)
+    ccxt_symbol = tv.symbol
 
-        # ---- 의도 판별 ----
-        # ① 포지션 없을 때: 무조건 '진입'
-        # ② 포지션 있을 때:
-        #    - 요청 방향이 '반대'면 기본 '청산'
-        #    - (옵션) size가 포지션 수량과 거의 같으면 청산 의도 강화
-        opposite = (pos_side == "long" and side == "sell") or (pos_side == "short" and side == "buy")
-        close_by_size = is_close_intent(amount_req, net_abs, lot_step, CLOSE_TOLERANCE_PCT) if net_abs > 0 else False
-        force_reduce = bool(body.get("reduceOnly", False))  # TV에서 명시했다면 최우선
+    # Bitget 마켓에 심볼이 없으면 오류
+    await ex.load_markets()
+    if ccxt_symbol not in ex.markets:
+        raise HTTPException(400, f"unknown symbol on bitget: {ccxt_symbol}")
 
-        intent = "open"
-        reduce_only = False
+    try:
+        order = await route_order(
+            ex=ex,
+            symbol=ccxt_symbol,
+            side=tv.side,
+            order_type=tv.orderType,
+            size=tv.size,
+            price=tv.price
+        )
+        return {"ok": True, "order": order}
+    except ccxt.BaseError as e:
+        # Bitget 에러 메세지 그대로 노출 + 500
+        raise HTTPException(500, f"exchange_error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(500, f"runtime_error: {str(e)}")
 
-        if net_abs == 0:
-            intent = "open"
-        else:
-            if opposite:
-                intent = "close"
-                reduce_only = True  # 반대방향은 항상 청산 모드
-            if close_by_size or force_reduce:
-                intent = "close"
-                reduce_only = True
+# -----------------------------
+# 헬스체크
+# -----------------------------
+@app.get("/")
+async def root():
+    return {"status": "ok", "productType": PRODUCT_TYPE, "marginMode": MARGIN_MODE, "leverage": DEFAULT_LEVERAGE}
 
-        # ---- 청산 처리 보호장치 ----
-        if intent == "close":
-            # 포지션 수량 초과 주문 방지(역진입 차단)
-            amount_final = min(amount_final, net_abs)
-            # 청산인데 방향이 포지션 반대가 아니면(예: 롱인데 buy) 스킵
-            if (pos_side == "long" and side != "sell") or (pos_side == "short" and side != "buy"):
-                return {"ok": True, "skip": "close_side_mismatch"}
-            if amount_final <= 0:
-                return {"ok": True, "skip": "amount_zero_on_close"}
-        else:
-            # 진입인데 TV가 실수로 reduceOnly를 보냈으면 제거
-            if reduce_only:
-                reduce_only = False
-
-        plan = {
-            "symbol": symbol,
-            "tv_symbol": raw_symbol,
-            "side": side,
-            "intent": intent,
-            "amount_req": amount_req,
-            "amount_final": amount_final,
-            "price": price,
-            "pos_side": pos_side,
-            "pos_abs": net_abs,
-            "sizing_mode": sizing_mode,
-            "reduceOnly": reduce_only,
-            "productType": PRODUCT_TYPE,
-        }
-
-        # 포지션 0이고 intent==close로 판정되었다면(예: 연속 종료신호 두 번째) 스킵
-        if net_abs == 0 and intent == "close":
-            return {"ok": True, "skip": "no_position_to_close", "plan": plan}
-
-        # 최종 주문
-        order = await place_market(symbol, side, amount_final, reduce_only)
-        plan["order_id"] = order.get("id")
-        return {"ok": True, "plan": plan, "order": order}
-
-
-@app.get("/health")
-async def health():
-    return {"ok": True}
+# -----------------------------
+# 종료 훅
+# -----------------------------
+@app.on_event("shutdown")
+async def shutdown_event():
+    global _ex
+    if _ex is not None:
+        try:
+            await _ex.close()
+        except Exception:
+            pass
