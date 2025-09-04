@@ -1,79 +1,100 @@
 import os
-import time
-from typing import Literal, Optional
+import json
+import logging
+import traceback
+from typing import Optional
 
 from fastapi import FastAPI, Request, HTTPException
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, validator
 
-from trade import BitgetTrader
-from symbol_map import normalize_tv_symbol, is_supported_market
+from symbol_map import tv_to_ccxt
+from trade import build_exchange, smart_route, PRODUCT_TYPE, DRY_RUN
 
-app = FastAPI(title="TV → Bitget Router", version="1.0.0")
+# ===== 로깅 =====
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+log = logging.getLogger("router.app")
 
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-ALLOWED_SYMBOLS = set(s.strip() for s in os.getenv("ALLOWED_SYMBOLS", "").split(",") if s.strip())
+app = FastAPI(title="tv-bitget-router", version="2.0")
 
-# --- 단순 중복 방지(몇 초 내 동일 payload drop) ---
-_seen = {}
-DEDUP_WINDOW_SEC = 6.0
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mySecret123!")
 
-class TVPayload(BaseModel):
+# ===== Pydantic 모델 =====
+class OrderIn(BaseModel):
     secret: str
-    symbol: str      # e.g. "ETHUSDT.P"
-    side: Literal["buy","sell"]
-    orderType: Literal["market","limit"] = "market"
+    symbol: str
+    side: str
+    orderType: str = Field(default="market")
     size: float
 
-    @field_validator("size")
-    @classmethod
-    def _size_pos(cls, v: float) -> float:
-        if v <= 0:
-            raise ValueError("size must be positive")
+    @validator("side")
+    def v_side(cls, v: str):
+        s = (v or "").strip().lower()
+        if s not in ("buy", "sell"):
+            raise ValueError("side must be buy/sell")
+        return s
+
+    @validator("orderType")
+    def v_type(cls, v: str):
+        if (v or "").lower() != "market":
+            raise ValueError("orderType must be market")
         return v
 
-trader = BitgetTrader()  # ccxt 초기화 포함
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "ts": int(time.time())}
+    return {
+        "ok": True,
+        "productType": PRODUCT_TYPE,
+        "dryRun": DRY_RUN,
+    }
+
 
 @app.post("/webhook")
-async def webhook(req: Request, payload: TVPayload):
-    # 1) secret 검증
-    if WEBHOOK_SECRET and payload.secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="invalid secret")
-
-    # 2) 간단 중복방지
-    sig = (payload.symbol, payload.side, round(payload.size, 8), payload.orderType)
-    now = time.monotonic()
-    if sig in _seen and now - _seen[sig] < DEDUP_WINDOW_SEC:
-        return {"status": "skipped-duplicate"}
-    _seen[sig] = now
-
-    # 3) 화이트리스트(옵션)
-    if ALLOWED_SYMBOLS and payload.symbol not in ALLOWED_SYMBOLS:
-        return {"status": "ignored", "reason": "symbol not allowed"}
-
-    # 4) TV 심볼 → Bitget 선물 심볼
-    ccxt_symbol = normalize_tv_symbol(payload.symbol)  # "ETH/USDT:USDT" 등
-    if not ccxt_symbol:
-        raise HTTPException(status_code=400, detail=f"unsupported tv symbol: {payload.symbol}")
-
-    # 5) 시장 지원여부 확인
-    supported = await is_supported_market(trader.exchange, ccxt_symbol)
-    if not supported:
-        # 마켓이 Bitget에 없음
-        return {"status": "ignored", "reason": f"unsupported market {ccxt_symbol}"}
-
-    # 6) 주문 라우팅(규칙: 반대 신호 = reduce-only 청산, flip 금지)
+async def webhook(req: Request):
     try:
-        result = await trader.route_order(
-            ccxt_symbol=ccxt_symbol,
-            tv_side=payload.side,
-            size=payload.size,
-            order_type=payload.orderType,
-        )
-        return {"status": "ok", "result": result}
+        payload = await req.json()
+    except Exception:
+        body = await req.body()
+        log.error(f"[WEBHOOK] invalid json body={body!r}")
+        raise HTTPException(status_code=400, detail="invalid json")
+
+    # 로우 로깅(민감정보 제외)
+    safe_log = {k: payload.get(k) for k in ("secret", "symbol", "side", "orderType", "size")}
+    safe_log["secret"] = "***"
+    log.info(f"[WEBHOOK] recv={safe_log}")
+
+    # 검증
+    try:
+        data = OrderIn(**payload)
     except Exception as e:
-        # FastAPI가 stacktrace까지 반환하지 않도록 메시지 정리
-        raise HTTPException(status_code=500, detail=f"exchange_error: {e}") from None
+        log.error(f"[VALIDATE] {e}")
+        raise HTTPException(status_code=400, detail=f"bad payload: {e}")
+
+    if data.secret != WEBHOOK_SECRET:
+        log.error("[AUTH] secret mismatch")
+        raise HTTPException(status_code=403, detail="bad secret")
+
+    ccxt_symbol = tv_to_ccxt(data.symbol)
+    log.info(f"[SYMBOL] {data.symbol} -> {ccxt_symbol} (productType={PRODUCT_TYPE})")
+
+    # Bitget 연결
+    try:
+        ex = build_exchange()
+    except Exception as e:
+        log.error(f"[CONFIG] {e}")
+        raise HTTPException(status_code=500, detail=f"bitget config error: {e}")
+
+    # 주문 라우트
+    try:
+        res = await smart_route(
+            ex, symbol=ccxt_symbol, side=data.side, size=float(data.size)
+        )
+        log.info(f"[DONE] orders={res}")
+        return {"ok": True, "orders": res, "dryRun": DRY_RUN}
+    except Exception as e:
+        # Bitget/ccxt 에러 메시지를 그대로 내려주어 디버깅 가능하게
+        log.error(f"[CCXT_ERROR] {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"{e}")
