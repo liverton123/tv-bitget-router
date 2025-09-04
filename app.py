@@ -1,186 +1,229 @@
-import os, json, time
-from typing import Dict, Any, Optional
-from fastapi import FastAPI, Request, HTTPException
+import os, json, logging
+from typing import Any, Dict
+
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import ccxt.async_support as ccxt
 
-app = FastAPI()
+# =========================
+# 설정 로딩 (ENV)
+# =========================
+ALLOWED_PRODUCT_TYPES = {"umcbl", "cmcbl", "dmcbl"}  # Bitget 표준 productType (소문자)
 
-# ---------- ENV: 옛/새 이름 모두 지원 ----------
-def pick(*names):
-    for n in names:
-        v = os.getenv(n)
-        if v:
-            return v
-    return None
+def read_config():
+    key = os.getenv("BITGET_API_KEY", "").strip()
+    secret = os.getenv("BITGET_API_SECRET", "").strip()
+    password = os.getenv("BITGET_API_PASSWORD", "").strip()
+    product_type = (os.getenv("BITGET_PRODUCT_TYPE", "") or "umcbl").strip().lower()
 
-BITGET_KEY       = pick("BITGET_KEY", "BITGET_API_KEY")
-BITGET_SECRET    = pick("BITGET_SECRET", "BITGET_API_SECRET")
-BITGET_PASSWORD  = pick("BITGET_PASSWORD", "BITGET_API_PASSWORD")
-PRODUCT_TYPE     = (os.getenv("BITGET_PRODUCT_TYPE") or "umcbl").lower()
+    if product_type not in ALLOWED_PRODUCT_TYPES:
+        raise RuntimeError(
+            f"Invalid BITGET_PRODUCT_TYPE='{product_type}', allowed={sorted(ALLOWED_PRODUCT_TYPES)}"
+        )
 
-ALLOW_SHORT_WHEN_FLAT = (os.getenv("ALLOW_SHORTS") or os.getenv("ALLOW_SHORT_WHEN_FLAT") or "false").lower() == "true"
-ALLOW_REVERSE         = (os.getenv("ALLOW_REVERSE") or "false").lower() == "true"
+    missing = [n for n, v in [
+        ("BITGET_API_KEY", key),
+        ("BITGET_API_SECRET", secret),
+        ("BITGET_API_PASSWORD", password),
+    ] if not v]
+    if missing:
+        raise RuntimeError(f"Missing env: {', '.join(missing)}")
 
-missing = [n for n,v in {"KEY":BITGET_KEY,"SECRET":BITGET_SECRET,"PASSWORD":BITGET_PASSWORD}.items() if not v]
-if missing:
-    print(f"⚠️  Bitget env missing: {missing}")
-else:
-    print(f"✅ Bitget env loaded. productType={PRODUCT_TYPE}, allow_short_when_flat={ALLOW_SHORT_WHEN_FLAT}, allow_reverse={ALLOW_REVERSE}")
+    dry_run = os.getenv("DRY_RUN", "false").strip().lower() in ("1", "true", "yes")
+    allow_shorts = os.getenv("ALLOW_SHORTS", "true").strip().lower() in ("1", "true", "yes")
+    close_tol = float(os.getenv("CLOSE_TOLERANCE_PCT", "0.0") or 0)
 
-# ---------- CCXT ----------
-ex = ccxt.bitget({
-    "apiKey": BITGET_KEY or "",
-    "secret": BITGET_SECRET or "",
-    "password": BITGET_PASSWORD or "",
-    "enableRateLimit": True,
-    "options": {
-        "defaultType": "swap",
-        "defaultSubType": "linear",
-        "productType": PRODUCT_TYPE,   # ccxt bitget params
-    },
-})
+    return {
+        "key": key,
+        "secret": secret,
+        "password": password,
+        "product_type": product_type,
+        "dry_run": dry_run,
+        "allow_shorts": allow_shorts,
+        "close_tol": close_tol,
+    }
 
-_markets_loaded = False
-_symbol_cache: Dict[str, str] = {}  # tv_symbol -> ccxt_symbol
-
-async def ensure_markets():
-    global _markets_loaded
-    if not _markets_loaded:
-        await ex.load_markets()
-        _markets_loaded = True
-
-def parse_tv_base(tv_symbol: str) -> Optional[str]:
-    """ 'VIRTUAUSDT.P' -> 'VIRTUA' """
+# =========================
+# 심볼 변환 (TV -> Bitget/ccxt)
+# =========================
+def tv_to_bitget(tv_symbol: str) -> str:
+    """
+    TV 예: 'ETHUSDT.P' or 'ETHUSDT' -> 'ETH/USDT:USDT'
+    """
     if not tv_symbol:
-        return None
-    s = tv_symbol.upper().replace(".P", "")
-    if s.endswith("USDT"):
-        return s[:-5]
-    return None
+        raise ValueError("empty symbol")
 
-async def resolve_symbol_from_markets(tv_symbol: str) -> Optional[str]:
-    """마켓 테이블에서 실제 스왑(USDT 선물) 심볼을 찾아 반환"""
-    await ensure_markets()
-    base = parse_tv_base(tv_symbol)
-    if not base:
-        return None
+    s = tv_symbol.upper().replace("PERP", "").replace(".P", "")
+    if not s.endswith("USDT"):
+        raise ValueError(f"Unsupported symbol format: {tv_symbol}")
+    base = s[:-4]  # strip 'USDT'
+    return f"{base}/USDT:USDT"
 
-    # 캐시 우선
-    if tv_symbol in _symbol_cache:
-        return _symbol_cache[tv_symbol]
+# =========================
+# Bitget 클라이언트 (요청마다 fresh)
+# =========================
+def make_exchange(cfg: dict):
+    return ccxt.bitget({
+        "apiKey": cfg["key"],
+        "secret": cfg["secret"],
+        "password": cfg["password"],
+        "options": {
+            "defaultType": "swap",
+            "adjustForTimeDifference": True,
+        },
+        "enableRateLimit": True,
+        "timeout": 15000,
+    })
 
-    # 조건: swap, linear, quote=USDT, base 일치
-    for m in ex.markets.values():
-        try:
-            if not m.get("swap"):
-                continue
-            if m.get("linear") is False:
-                continue
-            if (m.get("quote") or "").upper() != "USDT":
-                continue
-            if (m.get("base") or "").upper() != base:
-                continue
-            ccxt_symbol = m.get("symbol")
-            if ccxt_symbol:
-                _symbol_cache[tv_symbol] = ccxt_symbol
-                return ccxt_symbol
-        except Exception:
-            continue
+# =========================
+# 포지션/주문 로직
+# =========================
+async def ensure_market(ex: ccxt.bitget, ccxt_symbol: str) -> bool:
+    markets = await ex.load_markets()
+    return ccxt_symbol in markets
 
-    # 못 찾은 경우: 후보 출력(디버그용)
-    print(f"⚠️  No matching USDT-swap market for base='{base}'. tv_symbol='{tv_symbol}'")
-    return None
-
-async def get_net_position_by_tv(tv_symbol: str) -> Dict[str, Any]:
-    ccxt_symbol = await resolve_symbol_from_markets(tv_symbol)
-    if not ccxt_symbol:
-        raise HTTPException(400, f"unknown_symbol_for_swap: {tv_symbol}")
-
-    positions = await ex.fetch_positions([ccxt_symbol], params={"productType": PRODUCT_TYPE})
+async def fetch_net_position(ex, product_type: str, ccxt_symbol: str) -> float:
+    pos_list = await ex.fetch_positions([ccxt_symbol], params={"productType": product_type})
     net = 0.0
-    side = "flat"
-    for p in positions or []:
-        sz = float(p.get("contracts") or p.get("size") or 0)
-        if sz == 0:
-            continue
-        if p.get("side") == "long":  net += sz
-        if p.get("side") == "short": net -= sz
-    if net > 0: side = "long"
-    if net < 0: side = "short"
-    return {"side": side, "net": net, "symbol": ccxt_symbol}
+    for p in pos_list:
+        side = (p.get("side") or "").lower()
+        qty = float(p.get("contracts", 0) or 0)
+        if side == "long":
+            net += qty
+        elif side == "short":
+            net -= qty
+    return net
 
-async def market_order_by_tv(tv_symbol: str, side: str, size: float):
-    ccxt_symbol = await resolve_symbol_from_markets(tv_symbol)
-    if not ccxt_symbol:
-        raise HTTPException(400, f"unknown_symbol_for_swap: {tv_symbol}")
-    params = {"productType": PRODUCT_TYPE}
+async def route_order(ex, product_type: str, ccxt_symbol: str, side: str, size: float,
+                      allow_shorts: bool, close_tol_pct: float, dry_run: bool) -> Dict[str, Any]:
+    """
+    * buy/sell 은 '행동'이고, 청산/진입은 '현재 순포지션(net)'에 따라 결정
+    * 반대방향 신호는 청산, 같은 방향은 진입(또는 물타기)
+    """
+    if size <= 0:
+        return {"ok": False, "skipped": "size<=0"}
+
+    net = await fetch_net_position(ex, product_type, ccxt_symbol)
+    params = {"productType": product_type}
+
+    def within_tol(a, b):
+        if b == 0:
+            return a == 0
+        return abs(a - b) <= abs(b) * (close_tol_pct / 100.0)
+
     if side == "buy":
-        return await ex.create_market_buy_order(ccxt_symbol, size, params)
+        if net < 0:  # 순숏 -> buy는 숏 청산
+            amount = min(size, abs(net))
+            if within_tol(amount, abs(net)):
+                amount = abs(net)
+            if amount <= 0:
+                return {"ok": True, "skipped": "nothing_to_close"}
+            if dry_run:
+                return {"ok": True, "dry_run": True, "action": "close_short", "amount": amount}
+            return await ex.create_order(ccxt_symbol, "market", "buy", amount, None, params)
+        else:        # 무포/순롱 -> 롱 진입/물타기
+            if dry_run:
+                return {"ok": True, "dry_run": True, "action": "open_long", "amount": size}
+            return await ex.create_order(ccxt_symbol, "market", "buy", size, None, params)
+
+    elif side == "sell":
+        if net > 0:  # 순롱 -> sell은 롱 청산
+            amount = min(size, net)
+            if within_tol(amount, net):
+                amount = net
+            if amount <= 0:
+                return {"ok": True, "skipped": "nothing_to_close"}
+            if dry_run:
+                return {"ok": True, "dry_run": True, "action": "close_long", "amount": amount}
+            return await ex.create_order(ccxt_symbol, "market", "sell", amount, None, params)
+        else:        # 무포/순숏 -> 숏 진입/물타기
+            if not allow_shorts and net == 0:
+                return {"ok": True, "skipped": "shorts_disabled"}
+            if dry_run:
+                return {"ok": True, "dry_run": True, "action": "open_short", "amount": size}
+            return await ex.create_order(ccxt_symbol, "market", "sell", size, None, params)
+
     else:
-        return await ex.create_market_sell_order(ccxt_symbol, size, params)
+        return {"ok": False, "error": f"invalid side '{side}'"}
 
-# 간단 중복 방지
-_recent = {}
-def is_dup(symbol, side, size, ttl=5):
-    k = f"{symbol}:{side}:{size:.8f}"
-    now = time.time()
-    last = _recent.get(k)
-    _recent[k] = now
-    return last is not None and (now - last) < ttl
+# =========================
+# FastAPI
+# =========================
+app = FastAPI(title="tv-bitget-router")
+logger = logging.getLogger("router")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-# ---------- Routes ----------
 @app.get("/")
 async def root():
-    return {"status": "ok"}
+    return {"ok": True, "message": "tv-bitget-router up"}
 
 @app.post("/webhook")
 async def webhook(req: Request):
+    # 무조건 200 OK로 응답해 TV의 재시도 루프와 500 폭격 방지
     try:
-        data = await req.json()
+        payload = await req.json()
     except Exception:
-        raise HTTPException(400, "invalid json")
+        body = await req.body()
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception:
+            logger.exception("[PAYLOAD_PARSE_ERROR]")
+            return JSONResponse({"ok": False, "error": "bad_json"}, status_code=200)
 
-    tv_symbol = str(data.get("symbol") or "").strip()
-    side      = str(data.get("side") or "").lower().strip()
-    orderType = str(data.get("orderType") or "").lower().strip()
     try:
-        size = float(data.get("size"))
-    except Exception:
-        raise HTTPException(400, "invalid size")
+        cfg = read_config()  # 요청마다 최신 ENV 읽기
+    except Exception as e:
+        logger.exception("[CONFIG_ERROR] %s", e)
+        return JSONResponse({"ok": False, "error": f"config_error: {e}"}, status_code=200)
 
-    if not tv_symbol or side not in ("buy", "sell") or orderType != "market":
-        raise HTTPException(400, "missing/invalid fields")
+    # 필드 파싱
+    try:
+        tv_symbol = (payload.get("symbol") or "").strip()
+        side = (payload.get("side") or "").strip().lower()  # buy|sell
+        size = float(payload.get("size", 0) or 0)
+        order_type = (payload.get("orderType") or "").strip().lower()
+    except Exception as e:
+        logger.exception("[FIELD_ERROR] %s", e)
+        return JSONResponse({"ok": False, "error": "invalid_fields"}, status_code=200)
 
-    # 심볼을 먼저 해석해서 중복키에도 실제 CCXT 심볼을 사용
-    ccxt_symbol = await resolve_symbol_from_markets(tv_symbol)
-    if not ccxt_symbol:
-        raise HTTPException(400, f"unknown_symbol_for_swap: {tv_symbol}")
+    if order_type and order_type != "market":
+        return JSONResponse({"ok": True, "skipped": "only_market_supported"}, status_code=200)
 
-    if is_dup(ccxt_symbol, side, size):
-        return {"ok": True, "skipped": "duplicate"}
+    # 심볼 변환
+    try:
+        ccxt_symbol = tv_to_bitget(tv_symbol)
+    except Exception as e:
+        logger.warning("[SYMBOL_MAP_SKIP] %s", e)
+        return JSONResponse({"ok": True, "skipped": "bad_symbol_format"}, status_code=200)
 
-    pos = await get_net_position_by_tv(tv_symbol)
-    print(f"[{ccxt_symbol}] incoming {side} size={size} | pos={pos}")
+    ex = make_exchange(cfg)
+    try:
+        if not await ensure_market(ex, ccxt_symbol):
+            logger.warning("[SKIP_UNLISTED] %s", ccxt_symbol)
+            return JSONResponse({"ok": True, "skipped": "unlisted_symbol"}, status_code=200)
 
-    if side == "buy":
-        o = await market_order_by_tv(tv_symbol, "buy", size)
-        return {"ok": True, "order": o}
+        res = await route_order(
+            ex,
+            cfg["product_type"],
+            ccxt_symbol,
+            side,
+            size,
+            cfg["allow_shorts"],
+            cfg["close_tol"],
+            cfg["dry_run"],
+        )
 
-    # side == sell
-    if pos["side"] == "long":
-        o = await market_order_by_tv(tv_symbol, "sell", size)  # 롱 청산/부분청산
-        return {"ok": True, "closed_long": True, "order": o}
+        logger.info({"event": "order_result", "symbol": ccxt_symbol, "side": side, "size": size, "res": res})
+        return JSONResponse({"ok": True, "result": res}, status_code=200)
 
-    if pos["side"] == "flat":
-        if not ALLOW_SHORT_WHEN_FLAT:
-            return {"ok": True, "skipped": "flat_and_sell"}
-        o = await market_order_by_tv(tv_symbol, "sell", size)  # 숏 진입 허용 시
-        return {"ok": True, "opened_short": True, "order": o}
-
-    # 이미 숏 보유
-    if not ALLOW_REVERSE:
-        return {"ok": True, "skipped": "already_short"}
-    # 반전(간단히 전량 청산 후 롱 진입까지 하려면 여기에 buy size 추가)
-    o = await market_order_by_tv(tv_symbol, "buy", abs(pos["net"]))
-    return {"ok": True, "reversed_to_long": True, "close_short_order": o}
+    except ccxt.BaseError as e:
+        logger.exception("[CCXT_ERROR] %s", e)
+        return JSONResponse({"ok": False, "error": f"ccxt:{str(e)}"}, status_code=200)
+    except Exception as e:
+        logger.exception("[UNEXPECTED] %s", e)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
+    finally:
+        try:
+            await ex.close()
+        except Exception:
+            pass
