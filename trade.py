@@ -1,201 +1,294 @@
-# trade.py
 import os
-import asyncio
+import math
 import logging
-from typing import Optional, Dict, Any
+from typing import Dict, Any, List, Optional
 
-import ccxt.async_support as ccxt
+import ccxt.async_support as ccxt  # 비동기 CCXT
 
 log = logging.getLogger("router.trade")
 
-BITGET_API_KEY = os.getenv("BITGET_API_KEY", "")
-BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "")
-BITGET_API_PASSWORD = os.getenv("BITGET_API_PASSWORD", "")
+DEFAULT_LEVERAGE = int(os.getenv("MAX_LEVERAGE", "10"))
+FRACTION_PER_TRADE = float(os.getenv("FRACTION_PER_TRADE", "0.1"))  # 총자산 대비
+FORCE_EQUAL_NOTIONAL = os.getenv("FORCE_EQUAL_NOTIONAL", "false").lower() == "true"
+CLOSE_TOLERANCE_PCT = float(os.getenv("CLOSE_TOLERANCE_PCT", "0.02"))  # 2%
 
-# Bitget USDT-M 선물
-PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "umcbl").lower()  # 'umcbl'
-MARGIN_COIN = os.getenv("MARGIN_COIN", "USDT").upper()            # 'USDT'
-
-# 리스크/포지션 설정
-ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() == "true"
-FORCE_EQUAL_NOTIONAL = os.getenv("FORCE_EQUAL_NOTIONAL", "true").lower() == "true"
-FRACTION_PER_TRADE = float(os.getenv("FRACTION_PER_TRADE", "0.10"))  # 계정 순자산의 n%
-MAX_LEVERAGE = int(os.getenv("MAX_LEVERAGE", "10"))
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
-
-# singleton exchange
-_exchange_singleton = None
-
-async def get_exchange_singleton():
-    global _exchange_singleton
-    if _exchange_singleton is None:
-        if not (BITGET_API_KEY and BITGET_API_SECRET and BITGET_API_PASSWORD):
-            raise RuntimeError("Bitget API envs missing. Set BITGET_API_KEY/SECRET/PASSWORD")
-
-        ex = ccxt.bitget({
-            "apiKey": BITGET_API_KEY,
-            "secret": BITGET_API_SECRET,
-            "password": BITGET_API_PASSWORD,
-            "enableRateLimit": True,
-            "options": {
-                "defaultType": "swap",  # linear swap
-            }
-        })
-        await ex.load_markets()
-        _exchange_singleton = ex
-    return _exchange_singleton
-
-# ===== Symbol helpers =====
-def normalize_symbol(raw: str) -> str:
+# ---------------------------------------------------------------------
+# 안전한 심볼 정규화
+# ---------------------------------------------------------------------
+def normalize_symbol(raw: Any) -> str:
     """
-    TV에서 오는 예: 'BTCUSDT.P', 'VINEUSDT.P'
-    CCXT 통일 심볼: 'BTC/USDT:USDT'
+    허용 입력:
+      - 'BTCUSDT.P', 'ETHUSDT'
+      - 'BTC/USDT:USDT' (이미 정규화)
+      - 'XRP/USDT' (콜론 없음)
+    반환: 'BASE/USDT:USDT'
     """
-    s = raw.strip().upper()
-    if s.endswith(".P"):
-        s = s[:-2]
-    if s.endswith(":USDT"):
-        # 이미 'BTC/USDT:USDT' 형태일 수 있음
-        return s
-    if s.endswith("USDT"):
-        base = s[:-4]
+    if raw is None:
+        raise ValueError("symbol is missing")
+    if not isinstance(raw, str):
+        raw = str(raw)
+
+    s = raw.strip()
+    if not s:
+        raise ValueError("symbol is empty")
+
+    # 이미 CCXT 포맷
+    if "/" in s and ":USDT" in s:
+        return s.upper()
+
+    u = s.upper()
+
+    # TradingView .P 접미사 제거
+    if u.endswith(".P"):
+        u = u[:-2]
+
+    # 'BTC/USDT' -> 'BTC/USDT:USDT'
+    if "/" in u and u.endswith("USDT") and ":USDT" not in u:
+        return f"{u}:USDT"
+
+    # 'BTCUSDT' -> 'BTC/USDT:USDT'
+    if u.endswith("USDT") and "/" not in u:
+        base = u[:-4]
         return f"{base}/USDT:USDT"
-    # 최후의 보정
-    return s.replace("USDT.P", "/USDT:USDT").replace("USDT", "/USDT:USDT")
 
-# ===== Position helpers =====
-async def fetch_positions_all(ex) -> list:
-    # Bitget은 fetch_positions에 productType, marginCoin 필요
-    params = {"productType": PRODUCT_TYPE, "marginCoin": MARGIN_COIN}
-    return await ex.fetch_positions(params)
+    # 마지막 안전망
+    if "USDT" in u and ":USDT" not in u and "/" not in u:
+        base = u.replace("USDT", "")
+        return f"{base}/USDT:USDT"
 
-async def get_net_position(ex, symbol: str) -> float:
+    return u
+
+
+# ---------------------------------------------------------------------
+# CCXT 익스체인지
+# ---------------------------------------------------------------------
+async def make_exchange(api_key: str, api_secret: str, password: str, dry_run: bool):
+    params = {
+        "apiKey": api_key or "",
+        "secret": api_secret or "",
+        "password": password or "",
+        "options": {"defaultType": "swap"},  # 선물/스왑
+        "enableRateLimit": True,
+    }
+    ex = ccxt.bitget(params)
+    if dry_run:
+        log.warning("[DRY_RUN] 실제 주문은 발생하지 않습니다.")
+    return ex
+
+
+# ---------------------------------------------------------------------
+# Bitget 포지션/자산 조회 래퍼
+# ---------------------------------------------------------------------
+async def fetch_positions_all(ex, product_type: str, margin_coin: str) -> List[Dict[str, Any]]:
     """
-    해당 심볼의 순포지션 계약수(롱=+, 숏=-).
-    ccxt bitget의 amount(contracts)가 양수(롱)/음수(숏)로 제공된다.
+    Bitget은 productType, marginCoin이 필요. CCXT의 fetch_positions에 파라미터 넘김.
     """
-    positions = await fetch_positions_all(ex)
+    try:
+        positions = await ex.fetch_positions(
+            params={"productType": product_type, "marginCoin": margin_coin}
+        )
+        return positions or []
+    except Exception as e:
+        log.error("[CCXT_ERROR] fetch_positions failed")
+        raise
+
+async def get_net_position(ex, symbol: str, product_type: str, margin_coin: str) -> float:
+    """
+    롱 수량(양수) + 숏 수량(음수)의 '순 포지션 계약수' 반환
+    """
+    positions = await fetch_positions_all(ex, product_type, margin_coin)
     net = 0.0
-    for p in positions or []:
-        if p.get("symbol") == symbol and p.get("marginCoin", MARGIN_COIN) == MARGIN_COIN:
-            amt = float(p.get("contracts", p.get("amount", 0.0)) or 0.0)
-            net += amt
+    for p in positions:
+        # CCXT 통일 키
+        s = (p.get("symbol") or p.get("info", {}).get("symbol")).upper()
+        if s != symbol.upper():
+            continue
+        # Bitget: info 객체 안 side별 size가 있을 수 있음
+        sz = float(p.get("contracts") or p.get("info", {}).get("total", 0) or 0)
+        side = (p.get("side") or p.get("info", {}).get("holdSide", "")).lower()
+        if side == "long":
+            net += sz
+        elif side == "short":
+            net -= sz
     return net
 
-async def get_price(ex, symbol: str) -> float:
-    t = await ex.fetch_ticker(symbol)
-    return float(t.get("last") or t.get("close") or 0.0)
 
-async def get_free_usdt(ex) -> float:
-    bal = await ex.fetch_balance()
-    usdt = bal.get("USDT", {}) or {}
-    # futures에서는 'free' 대신 'total'/'used'일 수 있음 → 안전하게
-    free = usdt.get("free", None)
-    if free is None:
-        free = float(usdt.get("total", 0.0)) - float(usdt.get("used", 0.0))
-    return float(free or 0.0)
-
-async def ensure_leverage(ex, symbol: str):
-    # Bitget은 심볼별 레버리지 설정 필요할 수 있음
-    try:
-        lev = MAX_LEVERAGE
-        await ex.set_leverage(lev, symbol, params={"productType": PRODUCT_TYPE, "marginCoin": MARGIN_COIN})
-    except Exception as e:
-        log.info("set_leverage skip/warn: %s", e)
-
-def clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
-
-async def compute_amount(ex, symbol: str, side: str, incoming_size: Optional[float]) -> float:
-    """
-    주문 수량(contracts) 산출.
-    - FORCE_EQUAL_NOTIONAL=True 이면: (free * FRACTION * MAX_LEVERAGE) / price
-      → 계정 일부만 사용하고 과도한 진입 방지
-    - False면: TV에서 주는 size(contracts) 사용
-    """
-    if not FORCE_EQUAL_NOTIONAL and incoming_size:
-        return float(incoming_size)
-
-    price = await get_price(ex, symbol)
-    free = await get_free_usdt(ex)
-    if price <= 0:
-        raise RuntimeError(f"Bad price for {symbol}")
-    margin_budget = free * FRACTION_PER_TRADE  # 사용할 증거금
-    notional = margin_budget * MAX_LEVERAGE
-    contracts = notional / price
-    # 최소 1 계약 보장
-    return max(1.0, contracts)
-
+# ---------------------------------------------------------------------
+# 주문 배치
+# ---------------------------------------------------------------------
 async def place_order(
     ex,
     symbol: str,
-    side: str,          # 'buy' or 'sell'
-    order_type: str,    # 'market' only here
-    amount: float,
-    reduce_only: bool = False,
-) -> Dict[str, Any]:
+    side: str,
+    size: float,
+    reduce_only: bool,
+    order_type: str,
+    product_type: str,
+    margin_coin: str,
+):
+    """
+    Bitget createOrder:
+      params = { "productType": "umcbl", "marginCoin": "USDT", "reduceOnly": True/False }
+    size는 계약수(coin-margined이 아니라 usdt-margined 스왑 기준)
+    """
+    # 방어: 음수/0 방지
+    qty = float(size)
+    if qty <= 0:
+        return {"skipped": True, "reason": "non-positive size"}
 
-    params = {
-        "reduceOnly": reduce_only,
-        "productType": PRODUCT_TYPE,
-        "marginCoin": MARGIN_COIN,
-    }
+    if os.getenv("DRY_RUN", "false").lower() == "true":
+        log.info("[DRY_RUN] %s %s size=%s reduceOnly=%s", side, symbol, qty, reduce_only)
+        return {"dry_run": True, "side": side, "symbol": symbol, "size": qty, "reduceOnly": reduce_only}
 
-    if DRY_RUN:
-        log.info("[DRY] %s %s amt=%.6f reduceOnly=%s", side, symbol, amount, reduce_only)
-        return {"dryRun": True, "side": side, "symbol": symbol, "amount": amount, "reduceOnly": reduce_only}
+    try:
+        order = await ex.create_order(
+            symbol=symbol,
+            type=order_type,
+            side=side,
+            amount=qty,
+            price=None,
+            params={
+                "productType": product_type,
+                "marginCoin": margin_coin,
+                "reduceOnly": reduce_only,
+            },
+        )
+        return order
+    except ccxt.InsufficientFunds as e:
+        log.error("[CCXT_ERROR] insufficient funds: %s", e)
+        raise
+    except ccxt.ExchangeError as e:
+        log.error("[CCXT_ERROR] %s", e)
+        raise
+    except Exception as e:
+        log.error("[CCXT_ERROR] create_order failed: %s", e)
+        raise
 
-    # Bitget은 create_order 사용 (type='market')
-    ord = await ex.create_order(symbol, order_type, side, amount, None, params)
-    return ord
 
+# ---------------------------------------------------------------------
+# 수량 산정 (가벼운 보호 로직)
+# ---------------------------------------------------------------------
+async def calc_order_size(
+    ex,
+    symbol: str,
+    fraction_per_trade: float = FRACTION_PER_TRADE,
+    leverage: int = DEFAULT_LEVERAGE,
+) -> float:
+    """
+    간단 버전: 계정 USDT 잔고 * fraction * leverage / 마크가격
+    FORCE_EQUAL_NOTIONAL=True면 심볼 무관 동일 명목가로 맞춤.
+    """
+    markets = await ex.load_markets()
+    m = markets.get(symbol)
+    if not m:
+        await ex.load_markets(True)
+        m = ex.markets.get(symbol)
+    if not m:
+        raise ValueError(f"Unknown market {symbol}")
+
+    # 잔고
+    bal = await ex.fetch_balance()
+    usdt = float(bal.get("USDT", {}).get("free", 0) or bal.get("USDT", {}).get("total", 0) or 0)
+
+    ticker = await ex.fetch_ticker(symbol)
+    price = float(ticker.get("last") or ticker.get("close") or ticker.get("info", {}).get("last", 0))
+
+    if price <= 0:
+        raise ValueError("bad price")
+
+    notional = usdt * fraction_per_trade * leverage
+    if FORCE_EQUAL_NOTIONAL:
+        # 예: 고정 100 USDT 명목
+        fixed = float(os.getenv("EQUAL_NOTIONAL_USDT", "100"))
+        notional = min(notional, fixed)
+
+    amount = max(0.0, notional / price)
+
+    # 시장의 최소수량 반영
+    min_amt = float(m.get("limits", {}).get("amount", {}).get("min", 0) or 0)
+    if min_amt and amount < min_amt:
+        amount = min_amt
+
+    precision = int(m.get("precision", {}).get("amount", 4))
+    amount = float(f"{amount:.{precision}f}")
+    return amount
+
+
+# ---------------------------------------------------------------------
+# 엔트리/청산 자동 라우팅
+# ---------------------------------------------------------------------
 async def smart_route(
     ex,
     symbol: str,
-    side: str,              # 'buy'/'sell'
-    order_type: str = "market",
-    incoming_size: Optional[float] = None
-) -> Dict[str, Any]:
+    side: str,
+    order_type: str,
+    size: float,
+    product_type: str,
+    margin_coin: str,
+):
     """
-    - 현재 포지션(net) 기준으로 reduceOnly/새 진입 자동판단
-    - 과도한 수량 방지(계정 일부만 사용)
-    - Bitget fetch_positions 40019 방지(필수 파라미터 항상 전달)
+    1) 현재 순포지션 확인
+    2) 같은 방향이면 '신규 진입'
+       반대 방향이면 먼저 reduceOnly로 닫고 남으면 신규 반전
     """
-    side = side.lower()
-    order_type = order_type.lower()
+    # 0) 사이즈 보정(0 또는 None이면 우리는 계산해서 사용)
+    if size in (None, 0, "0"):
+        size = await calc_order_size(ex, symbol)
 
-    await ensure_leverage(ex, symbol)
+    net = await get_net_position(ex, symbol, product_type, margin_coin)
+    log.info("[ROUTER] net=%s incoming side=%s size=%s", net, side, size)
 
-    # 현재 순포지션
-    net = await get_net_position(ex, symbol)
-    log.info("[ROUTER] %s net=%.6f incoming side=%s", symbol, net, side)
+    results = []
 
-    # 들어온 주문 의도
-    want_long = (side == "buy")
-    want_short = (side == "sell")
+    if net == 0:
+        # 그냥 신규
+        res = await place_order(
+            ex, symbol, side, size, False, order_type, product_type, margin_coin
+        )
+        results.append({"entry": res})
+        return results
 
-    # 숏 금지 설정
-    if want_short and not ALLOW_SHORTS and net <= 0:
-        return {"skipped": True, "reason": "shorts_not_allowed", "symbol": symbol}
+    if net > 0:  # 현재 롱
+        if side == "buy":
+            # 롱 추가
+            res = await place_order(
+                ex, symbol, "buy", size, False, order_type, product_type, margin_coin
+            )
+            results.append({"add_long": res})
+        else:
+            # 숏 신호 → 먼저 롱 청산
+            close_size = min(abs(net) * (1 + CLOSE_TOLERANCE_PCT), size)
+            res1 = await place_order(
+                ex, symbol, "sell", close_size, True, order_type, product_type, margin_coin
+            )
+            results.append({"close_long": res1})
+            # 남은 사이즈 있으면 반전 진입
+            remaining = max(0.0, size - close_size)
+            if remaining > 0:
+                res2 = await place_order(
+                    ex, symbol, "sell", remaining, False, order_type, product_type, margin_coin
+                )
+                results.append({"open_short": res2})
 
-    # 수량 계산
-    amt = await compute_amount(ex, symbol, side, incoming_size)
+    else:  # net < 0, 현재 숏
+        if side == "sell":
+            # 숏 추가
+            res = await place_order(
+                ex, symbol, "sell", size, False, order_type, product_type, margin_coin
+            )
+            results.append({"add_short": res})
+        else:
+            # 롱 신호 → 먼저 숏 청산
+            close_size = min(abs(net) * (1 + CLOSE_TOLERANCE_PCT), size)
+            res1 = await place_order(
+                ex, symbol, "buy", close_size, True, order_type, product_type, margin_coin
+            )
+            results.append({"close_short": res1})
+            remaining = max(0.0, size - close_size)
+            if remaining > 0:
+                res2 = await place_order(
+                    ex, symbol, "buy", remaining, False, order_type, product_type, margin_coin
+                )
+                results.append({"open_long": res2})
 
-    # 1) 기존 포지션과 반대면 우선 청산(reduceOnly)
-    if (net > 0 and want_short) or (net < 0 and want_long):
-        close_size = min(abs(net), amt)
-        if close_size > 0:
-            log.info("[ROUTER] reduce-only close %.6f on %s", close_size, symbol)
-            res1 = await place_order(ex, symbol, side, close_size, reduce_only=True)
-            # 남은 양이 있고 반대 방향 신규 진입 허용이면 이어서 진입
-            remain = amt - close_size
-            if remain > 0:
-                log.info("[ROUTER] new entry remain %.6f on %s", remain, symbol)
-                res2 = await place_order(ex, symbol, side, remain, reduce_only=False)
-                return {"close": res1, "entry": res2}
-            return {"close": res1}
-
-    # 2) 같은 방향이면 단순 증액(피라미딩) or 신규 진입
-    log.info("[ROUTER] entry %.6f on %s", amt, symbol)
-    res = await place_order(ex, symbol, side, amt, reduce_only=False)
-    return {"entry": res}
+    return results
