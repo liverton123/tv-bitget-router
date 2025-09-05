@@ -1,20 +1,18 @@
-import os, logging, ccxt.async_support as ccxt
+import os, logging, math
+import ccxt.async_support as ccxt
 from typing import Any, Dict, List
 
 log = logging.getLogger("router.trade")
 
 DEFAULT_LEVERAGE = int(os.getenv("MAX_LEVERAGE", "10"))
-# 1/20 고정
+# 항상 시드의 1/20 (=5%)
 FRACTION_PER_TRADE = float(os.getenv("FRACTION_PER_TRADE", "0.05"))
 
-FORCE_EQUAL_NOTIONAL = os.getenv("FORCE_EQUAL_NOTIONAL", "false").lower() == "true"
-EQUAL_NOTIONAL_USDT  = float(os.getenv("EQUAL_NOTIONAL_USDT", "100"))
-CLOSE_TOLERANCE_PCT = float(os.getenv("CLOSE_TOLERANCE_PCT", "0.02"))
+CLOSE_TOLERANCE_PCT = float(os.getenv("CLOSE_TOLERANCE_PCT", "0.0"))  # 0%로 고정(40804 방지)
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 
 def normalize_symbol(raw: Any) -> str:
     s = str(raw or "").strip()
-    if not s: raise ValueError("symbol empty")
     u = s.upper()
     if u.endswith(".P"): u = u[:-2]
     if "/" in u and ":USDT" in u: return u
@@ -37,115 +35,172 @@ async def make_exchange(api_key: str, api_secret: str, password: str, dry_run: b
         log.warning("[DRY_RUN] orders will NOT be sent")
     return ex
 
-# --- sizing: 항상 '시드의 1/20' 만큼만 마진 사용 ---
-async def calc_order_size_fixed_fraction(ex, symbol: str) -> float:
+# ---------- sizing ----------
+def _round_amount(amount: float, precision: int) -> float:
+    if precision < 0: precision = 0
+    q = 10 ** precision
+    return math.floor(amount * q) / q  # 내림해서 초과 청산/주문 방지
+
+async def _market_info(ex, symbol: str) -> Dict[str, Any]:
     markets = await ex.load_markets()
     m = markets.get(symbol) or {}
     if not m:
         await ex.load_markets(True)
         m = ex.markets.get(symbol) or {}
-        if not m: raise ValueError(f"unknown market {symbol}")
+    if not m:
+        raise ValueError(f"unknown market {symbol}")
+    return m
+
+async def calc_order_size_fixed_fraction(ex, symbol: str) -> float:
+    m = await _market_info(ex, symbol)
 
     bal = await ex.fetch_balance()
-    total = float(bal.get("USDT", {}).get("total", 0) or 0)     # 시드(총자산)
-    free  = float(bal.get("USDT", {}).get("free", 0) or 0)      # 사용 가능
+    total = float(bal.get("USDT", {}).get("total", 0) or 0)
+    free  = float(bal.get("USDT", {}).get("free", 0) or 0)
+
     ticker = await ex.fetch_ticker(symbol)
     price = float(ticker.get("last") or ticker.get("close") or 0)
-    if price <= 0: raise ValueError("bad price")
+    if price <= 0:
+        raise ValueError("bad price")
 
-    # 목표 마진 (시드의 1/20), free 부족하면 free의 98%로 클램프
-    target_margin = total * FRACTION_PER_TRADE
-    target_margin = min(target_margin, max(0.0, free) * 0.98)
+    # 목표 마진 = 시드(총자산) * 5%
+    desired_margin = total * FRACTION_PER_TRADE
+    # 최소 주문 금액(비트겟 대부분 5 USDT) 고려
+    min_cost = float(m.get("limits", {}).get("cost", {}).get("min", 5) or 5)
+    min_margin = min_cost / max(1, DEFAULT_LEVERAGE)
 
-    # 주문 수량 = (목표 마진 * 레버리지) / 가격
+    # 사용 가능한 범위로 클램프
+    target_margin = max(min_margin, min(desired_margin, free * 0.98))
+    if target_margin <= 0:
+        return 0.0
+
     notional = target_margin * DEFAULT_LEVERAGE
     amount = notional / price
 
-    # 거래소 최소수량/정밀도 적용
+    # 최소 수량/정밀도 적용
     min_amt = float(m.get("limits", {}).get("amount", {}).get("min", 0) or 0)
-    if min_amt and amount < min_amt: amount = min_amt
-    prec = int(m.get("precision", {}).get("amount", 4))
-    amount = float(f"{amount:.{prec}f}")
+    prec = int(m.get("precision", {}).get("amount", 3))
+    amount = max(amount, min_amt)
+    amount = _round_amount(amount, prec)
     return amount
 
-# --- positions (40019 회피) ---
-async def _fetch_position_single(ex, symbol: str, product_type: str):
-    try:
-        return await ex.fetch_position(symbol, {"productType": product_type})
-    except Exception as e:
-        log.info("fallback to all-position: %s", e)
-        return None
-
-async def _fetch_positions_all(ex, product_type: str) -> List[Dict[str, Any]]:
-    return await ex.fetch_positions(None, {"productType": product_type})
+# ---------- positions (40019 회피용 다중 시도) ----------
+async def _try_fetch_position(ex, symbol: str, product_type: str):
+    # 1) 단일 심볼
+    for pt in (product_type, product_type.upper()):
+        try:
+            return await ex.fetch_position(symbol, {"productType": pt})
+        except Exception as e:
+            last = str(e)
+            continue
+    # 2) 전체 조회 후 필터
+    for pt in (product_type, product_type.upper(), None):
+        try:
+            positions = await ex.fetch_positions(None, {"productType": pt} if pt else {})
+            return next((p for p in positions or [] if (p.get("symbol") or p.get("info", {}).get("symbol", "")).upper() == symbol.upper()), None)
+        except Exception as e:
+            last = str(e)
+            continue
+    log.info("fetch_position fallback failed; assume flat")
+    return None
 
 async def get_net_position(ex, symbol: str, product_type: str, margin_coin: str) -> float:
-    su = symbol.upper()
-    p = await _fetch_position_single(ex, su, product_type)
-    if isinstance(p, dict) and p:
-        qty = float(p.get("contracts") or p.get("info", {}).get("total", 0) or 0)
-        side = (p.get("side") or p.get("info", {}).get("holdSide", "")).lower()
-        return qty if side == "long" else (-qty if side == "short" else 0.0)
+    p = await _try_fetch_position(ex, symbol, product_type)
+    if not p:
+        return 0.0
+    qty = float(p.get("contracts") or p.get("info", {}).get("total", 0) or 0)
+    side = (p.get("side") or p.get("info", {}).get("holdSide", "")).lower()
+    if side == "long":  return qty
+    if side == "short": return -qty
+    return 0.0
 
-    positions = await _fetch_positions_all(ex, product_type)
-    net = 0.0
-    for px in positions or []:
-        psym = (px.get("symbol") or px.get("info", {}).get("symbol", "")).upper()
-        if psym != su: continue
-        qty = float(px.get("contracts") or px.get("info", {}).get("total", 0) or 0)
-        side = (px.get("side") or px.get("info", {}).get("holdSide", "")).lower()
-        if side == "long":  net += qty
-        if side == "short": net -= qty
-    return net
-
-# --- order ---
-async def place_order(ex, symbol: str, side: str, size: float,
-                      reduce_only: bool, order_type: str,
-                      product_type: str, margin_coin: str):
+# ---------- orders ----------
+async def place_order(ex, symbol: str, side: str, size: float, reduce_only: bool,
+                      order_type: str, product_type: str, margin_coin: str):
     qty = float(size)
     if qty <= 0:
         return {"skipped": True, "reason": "non-positive size"}
+
     if DRY_RUN:
         log.info("[DRY_RUN] %s %s size=%s reduceOnly=%s", side, symbol, qty, reduce_only)
         return {"dry_run": True, "side": side, "symbol": symbol, "size": qty, "reduceOnly": reduce_only}
+
     params = {"reduceOnly": reduce_only, "productType": product_type, "marginCoin": margin_coin}
-    return await ex.create_order(symbol=symbol, type=order_type, side=side,
-                                 amount=qty, price=None, params=params)
+
+    try:
+        return await ex.create_order(symbol=symbol, type=order_type, side=side,
+                                     amount=qty, price=None, params=params)
+    except ccxt.BaseError as e:
+        msg = str(e)
+        # 40804: 청산 수량이 보유수량 초과 → 순수량으로 한 번 더 시도
+        if "40804" in msg or "cannot exceed the number of positions held" in msg:
+            try:
+                net = await get_net_position(ex, symbol, product_type, margin_coin)
+                m = await _market_info(ex, symbol)
+                prec = int(m.get("precision", {}).get("amount", 3))
+                retry_qty = _round_amount(max(0.0, min(abs(net), qty)), prec)
+                if retry_qty <= 0:
+                    return {"skipped": True, "reason": "nothing to close"}
+                return await ex.create_order(symbol=symbol, type=order_type, side=side,
+                                             amount=retry_qty, price=None, params=params)
+            except Exception as e2:
+                raise e2
+        raise
 
 async def smart_route(ex, symbol: str, side: str, order_type: str, size: float,
                       product_type: str, margin_coin: str, force_fixed_sizing: bool):
-    # size 강제 재계산(시그널 값 무시)
+    # 사이즈 강제(시그널 무시)
     if force_fixed_sizing:
         size = await calc_order_size_fixed_fraction(ex, symbol)
     else:
-        size = float(size) if size not in (None, "", "0") else 0.0
+        try:
+            size = float(size)
+        except:
+            size = 0.0
         if size <= 0:
             size = await calc_order_size_fixed_fraction(ex, symbol)
 
+    if size <= 0:
+        return [{"skipped": True, "reason": "insufficient free margin or min size"}]
+
     net = await get_net_position(ex, symbol, product_type, margin_coin)
     log.info("[ROUTER] net=%s incoming=%s size=%s", net, side, size)
+
     out = []
+    m = await _market_info(ex, symbol)
+    prec = int(m.get("precision", {}).get("amount", 3))
 
     if net == 0:
         out.append({"entry": await place_order(ex, symbol, side, size, False, order_type, product_type, margin_coin)})
         return out
 
-    if net > 0:
+    # 청산 수량은 절대 보유수량을 넘지 않도록 '내림' 처리
+    def clamp_close(q, net_abs):
+        q = min(net_abs, q)
+        return _round_amount(max(0.0, q), prec)
+
+    net_abs = abs(net)
+
+    if net > 0:  # 롱 보유
         if side == "buy":
             out.append({"add_long": await place_order(ex, symbol, "buy", size, False, order_type, product_type, margin_coin)})
         else:
-            close_sz = min(abs(net) * (1 + CLOSE_TOLERANCE_PCT), size)
-            out.append({"close_long": await place_order(ex, symbol, "sell", close_sz, True, order_type, product_type, margin_coin)})
-            rem = max(0.0, size - close_sz)
+            close_sz = clamp_close(size, net_abs)
+            if close_sz > 0:
+                out.append({"close_long": await place_order(ex, symbol, "sell", close_sz, True, order_type, product_type, margin_coin)})
+            rem = _round_amount(max(0.0, size - close_sz), prec)
             if rem > 0:
                 out.append({"open_short": await place_order(ex, symbol, "sell", rem, False, order_type, product_type, margin_coin)})
-    else:
+
+    else:       # 숏 보유
         if side == "sell":
             out.append({"add_short": await place_order(ex, symbol, "sell", size, False, order_type, product_type, margin_coin)})
         else:
-            close_sz = min(abs(net) * (1 + CLOSE_TOLERANCE_PCT), size)
-            out.append({"close_short": await place_order(ex, symbol, "buy", close_sz, True, order_type, product_type, margin_coin)})
-            rem = max(0.0, size - close_sz)
+            close_sz = clamp_close(size, net_abs)
+            if close_sz > 0:
+                out.append({"close_short": await place_order(ex, symbol, "buy", close_sz, True, order_type, product_type, margin_coin)})
+            rem = _round_amount(max(0.0, size - close_sz), prec)
             if rem > 0:
                 out.append({"open_long": await place_order(ex, symbol, "buy", rem, False, order_type, product_type, margin_coin)})
+
     return out
