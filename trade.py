@@ -1,6 +1,5 @@
-import os, math, logging
+import os, logging, ccxt.async_support as ccxt
 from typing import Any, Dict, List
-import ccxt.async_support as ccxt
 
 log = logging.getLogger("router.trade")
 
@@ -12,16 +11,14 @@ CLOSE_TOLERANCE_PCT = float(os.getenv("CLOSE_TOLERANCE_PCT", "0.02"))
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 
 def normalize_symbol(raw: Any) -> str:
-    if raw is None: raise ValueError("symbol missing")
-    s = str(raw).strip()
+    s = str(raw or "").strip()
     if not s: raise ValueError("symbol empty")
-    if "/" in s and ":USDT" in s: return s.upper()
     u = s.upper()
     if u.endswith(".P"): u = u[:-2]
-    if "/" in u and u.endswith("USDT") and ":USDT" not in u: return f"{u}:USDT"
-    if u.endswith("USDT") and "/" not in u:
-        return f"{u[:-4]}/USDT:USDT"
-    if "USDT" in u and ":USDT" not in u and "/" not in u:
+    if "/" in u and ":USDT" in u: return u
+    if u.endswith("USDT") and "/" not in u: return f"{u[:-4]}/USDT:USDT"
+    if "/" in u and u.endswith("USDT"): return f"{u}:USDT"
+    if "USDT" in u and "/" not in u and ":USDT" not in u:
         base = u.replace("USDT", "")
         return f"{base}/USDT:USDT"
     return u
@@ -32,43 +29,13 @@ async def make_exchange(api_key: str, api_secret: str, password: str, dry_run: b
         "secret": api_secret or "",
         "password": password or "",
         "enableRateLimit": True,
-        "options": {
-            "defaultType": "swap",
-        },
+        "options": {"defaultType": "swap"},
     })
     if dry_run:
         log.warning("[DRY_RUN] orders will NOT be sent")
     return ex
 
-async def _merge_params(base: Dict[str, Any], product_type: str, margin_coin: str) -> Dict[str, Any]:
-    p = dict(base or {})
-    p["productType"] = product_type
-    p["marginCoin"] = margin_coin
-    return p
-
-async def fetch_positions_all(ex, product_type: str, margin_coin: str) -> List[Dict[str, Any]]:
-    try:
-        # NOTE: ccxt signature = fetch_positions(symbols=None, params={})
-        params = await _merge_params({}, product_type, margin_coin)
-        positions = await ex.fetch_positions(None, params)
-        return positions or []
-    except Exception as e:
-        log.error("[CCXT_ERROR] fetch_positions failed: %s", e)
-        raise
-
-async def get_net_position(ex, symbol: str, product_type: str, margin_coin: str) -> float:
-    positions = await fetch_positions_all(ex, product_type, margin_coin)
-    net = 0.0
-    su = symbol.upper()
-    for p in positions:
-        psym = (p.get("symbol") or p.get("info", {}).get("symbol", "")).upper()
-        if psym != su: continue
-        qty = float(p.get("contracts") or p.get("info", {}).get("total", 0) or 0)
-        side = (p.get("side") or p.get("info", {}).get("holdSide", "")).lower()
-        if side == "long":  net += qty
-        if side == "short": net -= qty
-    return net
-
+# -------- balances & sizing --------
 async def _clamp_by_balance(ex, symbol: str, desired_amount: float) -> float:
     if desired_amount <= 0: return 0.0
     bal = await ex.fetch_balance()
@@ -106,6 +73,44 @@ async def calc_order_size(ex, symbol: str) -> float:
     amount = await _clamp_by_balance(ex, symbol, amount)
     return amount
 
+# -------- positions (40019 회피 로직) --------
+async def _fetch_position_single(ex, symbol: str, product_type: str):
+    try:
+        # 단건 조회 (권장)
+        return await ex.fetch_position(symbol, {"productType": product_type})
+    except Exception as e:
+        log.info("fallback to all-position: %s", e)
+        return None
+
+async def _fetch_positions_all(ex, product_type: str) -> List[Dict[str, Any]]:
+    # v2 all-position: productType만 보냄 (marginCoin 절대 같이 안 보냄)
+    return await ex.fetch_positions(None, {"productType": product_type})
+
+async def get_net_position(ex, symbol: str, product_type: str, margin_coin: str) -> float:
+    su = symbol.upper()
+    # 1) 단건
+    p = await _fetch_position_single(ex, su, product_type)
+    if isinstance(p, dict) and p:
+        qty = float(p.get("contracts") or p.get("info", {}).get("total", 0) or 0)
+        side = (p.get("side") or p.get("info", {}).get("holdSide", "")).lower()
+        return qty if side == "long" else (-qty if side == "short" else 0.0)
+    # 2) 전체 후 필터
+    try:
+        positions = await _fetch_positions_all(ex, product_type)
+    except Exception as e:
+        log.error("[CCXT_ERROR] fetch_positions failed: %s", e)
+        raise
+    net = 0.0
+    for px in positions or []:
+        psym = (px.get("symbol") or px.get("info", {}).get("symbol", "")).upper()
+        if psym != su: continue
+        qty = float(px.get("contracts") or px.get("info", {}).get("total", 0) or 0)
+        side = (px.get("side") or px.get("info", {}).get("holdSide", "")).lower()
+        if side == "long":  net += qty
+        if side == "short": net -= qty
+    return net
+
+# -------- order --------
 async def place_order(ex, symbol: str, side: str, size: float,
                       reduce_only: bool, order_type: str,
                       product_type: str, margin_coin: str):
@@ -115,9 +120,8 @@ async def place_order(ex, symbol: str, side: str, size: float,
     if DRY_RUN:
         log.info("[DRY_RUN] %s %s size=%s reduceOnly=%s", side, symbol, qty, reduce_only)
         return {"dry_run": True, "side": side, "symbol": symbol, "size": qty, "reduceOnly": reduce_only}
-
-    params = await _merge_params({"reduceOnly": reduce_only}, product_type, margin_coin)
     try:
+        params = {"reduceOnly": reduce_only, "productType": product_type, "marginCoin": margin_coin}
         return await ex.create_order(symbol=symbol, type=order_type, side=side,
                                      amount=qty, price=None, params=params)
     except ccxt.InsufficientFunds as e:
@@ -129,8 +133,8 @@ async def place_order(ex, symbol: str, side: str, size: float,
 
 async def smart_route(ex, symbol: str, side: str, order_type: str, size: float,
                       product_type: str, margin_coin: str):
-    if size in (None, 0, "0"):
-        size = await calc_order_size(ex, symbol)
+    size = float(size) if size not in (None, "", "0") else 0.0
+    if size <= 0: size = await calc_order_size(ex, symbol)
 
     net = await get_net_position(ex, symbol, product_type, margin_coin)
     log.info("[ROUTER] net=%s incoming=%s size=%s", net, side, size)
