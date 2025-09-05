@@ -2,7 +2,7 @@ import os, math, logging
 from typing import Any, Dict, List, Optional
 import ccxt.async_support as ccxt
 from config import (
-    FRACTION_PER_TRADE, MAX_OPEN_POSITIONS, DEFAULT_LEVERAGE,
+    FRACTION_PER_TRADE, MAX_OPEN_COINS, DEFAULT_LEVERAGE,
     REENTER_ON_OPPOSITE, PRODUCT_TYPE, MARGIN_COIN,
     REFERENCE_BALANCE_USDT, DRY_RUN
 )
@@ -66,7 +66,7 @@ async def _fetch_positions_all(ex) -> List[Dict[str, Any]]:
         log.error("fetch_positions error: %s", e)
         return []
 
-async def _count_open_symbols(ex) -> int:
+async def _open_coin_count(ex) -> int:
     pos = await _fetch_positions_all(ex)
     syms = set()
     for p in pos or []:
@@ -163,19 +163,19 @@ async def route_signal(ex, symbol: str, side: Optional[str], action: Optional[st
 
     net = await get_net_position(ex, symbol)
     out: List[Dict[str, Any]] = []
+    s = side.lower()
 
     if net == 0:
-        opened = await _count_open_symbols(ex)
-        if opened >= MAX_OPEN_POSITIONS:
-            return [{"skipped": True, "reason": f"max open positions reached ({opened}/{MAX_OPEN_POSITIONS})"}]
-        res = await place_order(ex, symbol, "buy" if side.lower() == "buy" else "sell", size, False)
+        opened_coins = await _open_coin_count(ex)
+        if opened_coins >= MAX_OPEN_COINS:
+            return [{"skipped": True, "reason": f"max open coins reached ({opened_coins}/{MAX_OPEN_COINS})"}]
+        res = await place_order(ex, symbol, "buy" if s == "buy" else "sell", size, False)
         out.append({"entry": res})
         return out
 
     m = await _market_info(ex, symbol)
     prec = int(m.get("precision", {}).get("amount", 3))
     net_abs = abs(net)
-    s = side.lower()
 
     if net > 0:
         if s == "buy":
