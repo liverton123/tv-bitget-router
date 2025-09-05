@@ -1,51 +1,73 @@
-import os, json, logging
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
-from trade import route_signal, make_exchange, normalize_symbol
+import os
+import json
+from decimal import Decimal
+from fastapi import FastAPI, Body
+import uvicorn
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
-                    format="%(asctime)s | %(levelname)s | %(name)s: %(message)s")
-log = logging.getLogger("router.app")
-
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mySecret123!")
-DRY_RUN        = os.getenv("DRY_RUN", "false").lower() == "true"
+from trade import smart_route, get_net_position
+from bitget_ccxt import make_exchange
+from risk import (
+    normalize_symbol,
+    MAX_COINS,
+    REQUIRE_INTENT_FOR_OPEN,
+    PRODUCT_TYPE,
+    MARGIN_COIN,
+)
 
 app = FastAPI()
 
+# Exchange instance (CCXT, single session for the process)
+ex = make_exchange(
+    api_key=os.getenv("BITGET_API_KEY", ""),
+    api_secret=os.getenv("BITGET_API_SECRET", ""),
+    api_password=os.getenv("BITGET_API_PASSWORD", ""),
+    enable_rate_limit=True,
+)
+
 @app.get("/")
-async def health():
-    return {"ok": True, "dryRun": DRY_RUN}
+def ping():
+    return {"ok": True}
 
 @app.post("/webhook")
-async def webhook(request: Request):
+async def webhook(payload: dict = Body(...)):
+    # Normalize/validate inputs
+    symbol = normalize_symbol(payload.get("symbol"))
+    side = (payload.get("side") or "").lower()  # "buy" | "sell"
+    order_type = (payload.get("orderType") or "market").lower()
+    intent = (payload.get("intent") or "").lower()  # "open" | "dca" | "close" | ""
+    raw_size = payload.get("size")
+
+    # Hard guards
+    if not symbol or side not in ("buy", "sell"):
+        return {"ok": True, "ignored": "bad symbol/side"}
+
     try:
-        data = json.loads((await request.body()).decode("utf-8"))
+        size = Decimal(str(raw_size))
     except Exception:
-        raise HTTPException(status_code=400, detail="malformed json")
+        size = Decimal("0")
 
-    if str(data.get("secret", "")) != str(WEBHOOK_SECRET):
-        raise HTTPException(status_code=401, detail="bad secret")
+    if size <= 0:
+        return {"ok": True, "ignored": "non-positive size"}
 
-    raw_symbol = data.get("symbol")
-    side = data.get("side")                  # "buy" | "sell" | None
-    action = (data.get("action") or "").lower()  # "close" | ""
+    # Current net position (signed base amount)
+    net = await get_net_position(ex, symbol, PRODUCT_TYPE, MARGIN_COIN)
 
-    if not raw_symbol:
-        raise HTTPException(status_code=400, detail="missing symbol")
-    if side is not None and str(side).lower() not in ("buy", "sell"):
-        raise HTTPException(status_code=400, detail="invalid side")
+    # Safety: when flat, do not open unless the intent explicitly allows it
+    if net == 0 and REQUIRE_INTENT_FOR_OPEN and intent not in {"open", "dca"}:
+        return {"ok": True, "ignored": "flat_and_no_open_intent"}
 
-    symbol = normalize_symbol(raw_symbol)
+    # Route
+    result = await smart_route(
+        ex=ex,
+        symbol=symbol,
+        side=side,
+        order_type=order_type,
+        size=size,
+        product_type=PRODUCT_TYPE,
+        margin_coin=MARGIN_COIN,
+        intent=intent,               # used to disambiguate open/dca/close
+    )
+    return {"ok": True, "result": result}
 
-    ex = await make_exchange()
-    try:
-        result = await route_signal(ex=ex, symbol=symbol, side=side, action=action)
-        return JSONResponse({"ok": True, "result": result})
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.exception("unhandled")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        try: await ex.close()
-        except: pass
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
