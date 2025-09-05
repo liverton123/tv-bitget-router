@@ -12,7 +12,7 @@ API_KEY = os.getenv("BITGET_API_KEY")
 API_SECRET = os.getenv("BITGET_API_SECRET")
 API_PASSWORD = os.getenv("BITGET_API_PASSWORD")
 
-PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "umcbl")
+PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "umcbl")  # umcbl = USDT 무기한
 MARGIN_COIN  = os.getenv("MARGIN_COIN", "USDT")
 
 ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() == "true"
@@ -41,16 +41,13 @@ async def webhook(request: Request):
         raise HTTPException(status_code=401, detail="bad secret")
 
     raw_symbol = data.get("symbol")
-    side = str(data.get("side", "")).lower()
+    side       = str(data.get("side", "")).lower()
     order_type = str(data.get("orderType", "market")).lower()
-    size = data.get("size")
+    size       = data.get("size")
 
-    if not raw_symbol:
-        raise HTTPException(status_code=400, detail="missing symbol")
-    if side not in ("buy", "sell"):
-        raise HTTPException(status_code=400, detail="missing/invalid side")
-    if size is None:
-        raise HTTPException(status_code=400, detail="missing size")
+    if not raw_symbol: raise HTTPException(status_code=400, detail="missing symbol")
+    if side not in ("buy", "sell"): raise HTTPException(status_code=400, detail="invalid side")
+    if size is None: raise HTTPException(status_code=400, detail="missing size")
     if side == "sell" and not ALLOW_SHORTS:
         return JSONResponse({"ok": False, "reason": "shorts disabled"}, status_code=202)
 
