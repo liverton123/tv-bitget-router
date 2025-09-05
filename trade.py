@@ -1,169 +1,228 @@
-from decimal import Decimal
-from typing import List, Dict, Any, Optional
-import asyncio
-from risk import (
-    round_size_to_step,
-    target_qty_for_margin,
-    can_open_new_coin,
-    FRACTION_PER_POSITION,
-    LEVERAGE,
-    PRODUCT_TYPE,
-    MARGIN_COIN,
-)
-from bitget_ccxt import (
-    get_mark_price,
-    reduce_only_order,
-    market_order,
-    fetch_positions_all,
-    fetch_balance_usdt_equity,
-)
+import os
+import re
+import math
+import ccxt.async_support as ccxt
 
-Dec = Decimal
-D0 = Dec("0")
+# ---------- env ----------
+DEFAULTS = {
+    "WEBHOOK_SECRET": "",
+    "BITGET_API_KEY": "",
+    "BITGET_API_SECRET": "",
+    "BITGET_API_PASSWORD": "",
+    "BITGET_PRODUCT_TYPE": "umcbl",
+    "MARGIN_MODE": "cross",            # for reference only; Bitget USDT-M default cross
+    "FRACTION_PER_POSITION": "0.05",   # 1/20 of equity
+    "MAX_COINS": "5",                  # cap on simultaneous distinct coins
+    "ALLOW_SHORTS": "true",
+    "CLOSE_TOLERANCE_PCT": "0.02",     # +2% buffer on reduce-only close
+    "DRY_RUN": "false",
+    "REQUIRE_INTENT_FOR_OPEN": "true", # only open/add when intent provided
+}
 
-# ---------- Position helpers ----------
-
-async def fetch_symbol_positions(ex, product_type: str, margin_coin: str) -> Dict[str, Dec]:
-    """
-    Returns {symbol: net_base_amount} for all symbols with non-zero position.
-    """
-    positions = await fetch_positions_all(ex, product_type, margin_coin)
-    out: Dict[str, Dec] = {}
-    for p in positions:
-        sym = p.get("symbol")
-        sz  = Dec(str(p.get("holdSideTotal", "0"))) if p.get("holdSide") else D0  # fallback
-        # CCXT unifies: amount (signed). Prefer unified if present.
-        amt = p.get("contracts") or p.get("amount") or 0
-        side = p.get("side")
-        signed = D0
-        try:
-            signed = Dec(str(amt))
-        except Exception:
-            signed = D0
-        # If CCXT gives unsigned, reconstruct from side
-        if signed == 0 and float(amt) != 0:
-            signed = Dec(str(amt)) * (Dec("1") if (side or "long").lower() == "long" else Dec("-1"))
-        if sym and signed != 0:
-            out[sym] = signed
+def load_env():
+    out = {}
+    for k, v in DEFAULTS.items():
+        out[k] = os.getenv(k, v)
+    # coercions
+    out["FRACTION_PER_POSITION"] = float(out["FRACTION_PER_POSITION"])
+    out["MAX_COINS"] = int(out["MAX_COINS"])
+    out["ALLOW_SHORTS"] = out["ALLOW_SHORTS"].lower() == "true"
+    out["DRY_RUN"] = out["DRY_RUN"].lower() == "true"
+    out["CLOSE_TOLERANCE_PCT"] = float(out["CLOSE_TOLERANCE_PCT"])
+    out["REQUIRE_INTENT_FOR_OPEN"] = out["REQUIRE_INTENT_FOR_OPEN"].lower() == "true"
     return out
 
-async def get_net_position(ex, symbol: str, product_type: str, margin_coin: str) -> Dec:
-    positions = await fetch_positions_all(ex, product_type, margin_coin, symbol=symbol)
-    net = D0
-    for p in positions:
-        amt = p.get("contracts") or p.get("amount") or 0
-        side = (p.get("side") or "").lower()
-        try:
-            q = Dec(str(amt))
-        except Exception:
-            q = D0
-        if q != 0:
-            if side == "long":
-                net += q
-            elif side == "short":
-                net -= q
-    return net
+# ---------- symbol normalize ----------
+EXCHANGE_PREFIXES = ("BINANCE:", "BYBIT:", "BITGET:", "OKX:", "OKEX:", "KUCOIN:")
 
-# ---------- Order wrappers ----------
+def normalize_symbol(sym: str) -> str:
+    s = (sym or "").strip().upper()
+    if not s:
+        return s
+    for p in EXCHANGE_PREFIXES:
+        if s.startswith(p):
+            s = s.split(":", 1)[1]
+            break
+    s = s.replace(" ", "")
+    if s.endswith(":USDT"):
+        s = s[:-5]
+    s = s.replace("/", "")
+    if s.endswith(".P"):
+        s = s[:-2]
+    if s.endswith("-PERP"):
+        s = s[:-5]
+    if s.endswith("PERPETUAL"):
+        s = s[:-9]
+    if s.endswith("USD") and not s.endswith("USDT"):
+        s = s + "T"
+    s = re.sub(r"(USDT)+$", "USDT", s)
+    return s
 
-async def place_open(ex, symbol: str, side: str, qty: Dec, product_type: str, margin_coin: str) -> Dict[str, Any]:
-    # Bitget linear USDT futures: "buy" opens long, "sell" opens short
-    return await market_order(
-        ex=ex,
-        symbol=symbol,
-        side=side,
-        qty=qty,
-        product_type=product_type,
-        margin_coin=margin_coin,
-        reduce_only=False,
-    )
+# ---------- market helpers ----------
+async def fetch_price(ex: ccxt.Exchange, symbol: str) -> float:
+    t = await ex.fetch_ticker(symbol)
+    px = t.get("last") or t.get("close") or t.get("ask") or t.get("bid")
+    return float(px)
 
-async def place_reduce_only(ex, symbol: str, side: str, qty: Dec, product_type: str, margin_coin: str) -> Dict[str, Any]:
-    return await reduce_only_order(
-        ex=ex,
-        symbol=symbol,
-        side=side,
-        qty=qty,
-        product_type=product_type,
-        margin_coin=margin_coin,
-    )
+async def fetch_equity_usdt(ex: ccxt.Exchange) -> float:
+    bal = await ex.fetch_balance()
+    usdt = bal.get("USDT") or {}
+    free = usdt.get("free")
+    total = usdt.get("total")
+    return float(total if total is not None else (free or 0.0))
 
-# ---------- Routing rules ----------
+def round_amount(ex: ccxt.Exchange, symbol: str, amount: float) -> float:
+    m = ex.markets[symbol]
+    step = (m.get("precision") or {}).get("amount")
+    if step is not None:
+        amount = ex.amount_to_precision(symbol, amount)
+    min_amt = (((m.get("limits") or {}).get("amount") or {}).get("min")) or 0.0
+    if min_amt and amount < min_amt:
+        amount = min_amt
+    return float(amount)
 
-STRICT_EXIT_ONLY = True  # opposite signals close-only (no flip)
+def net_contracts_from_position(p) -> float:
+    # ccxt bitget positions: "contracts" or "contractsSize"
+    return float(p.get("contracts", p.get("contractsSize", 0.0)) or 0.0)
+
+async def get_position_contracts(ex: ccxt.Exchange, symbol: str) -> float:
+    poss = await ex.fetch_positions([symbol])
+    for p in poss:
+        if p.get("symbol") == symbol:
+            return net_contracts_from_position(p)
+    return 0.0
+
+async def open_coin_count(ex: ccxt.Exchange) -> int:
+    poss = await ex.fetch_positions()
+    coins = set()
+    for p in poss:
+        c = net_contracts_from_position(p)
+        if abs(c) > 0:
+            coins.add(p.get("symbol"))
+    # count distinct coins (symbols)
+    return len(coins)
+
+# ---------- order helpers ----------
+async def create_order(
+    ex: ccxt.Exchange,
+    symbol: str,
+    side: str,
+    amount: float,
+    reduce_only: bool,
+    env: dict,
+    order_type: str = "market",
+):
+    params = {
+        "productType": env["BITGET_PRODUCT_TYPE"],
+        "reduceOnly": reduce_only,
+    }
+    if env["DRY_RUN"]:
+        return {"dry_run": True, "symbol": symbol, "side": side, "amount": amount, "reduce_only": reduce_only}
+    return await ex.create_order(symbol, "market", side, amount, None, params)
+
+async def close_all(ex: ccxt.Exchange, symbol: str, env: dict):
+    pos = await get_position_contracts(ex, symbol)
+    if abs(pos) < 1e-12:
+        return {"closed": 0.0, "reason": "no position"}
+    side = "sell" if pos > 0 else "buy"
+    amount = abs(pos) * (1.0 + env["CLOSE_TOLERANCE_PCT"])
+    amount = round_amount(ex, symbol, amount)
+    return await create_order(ex, symbol, side, amount, True, env)
+
+# ---------- sizing: fixed fraction of equity (1/20) ----------
+async def calc_open_amount(ex: ccxt.Exchange, symbol: str, env: dict) -> float:
+    eq = await fetch_equity_usdt(ex)
+    usd = max(0.0, eq * env["FRACTION_PER_POSITION"])
+    if usd <= 0:
+        return 0.0
+    px = await fetch_price(ex, symbol)
+    amt = usd / max(px, 1e-12)
+    amt = round_amount(ex, symbol, amt)
+    return float(amt)
+
+# ---------- intent router ----------
+def _side_dir(side: str) -> int:
+    if side == "buy":
+        return +1
+    if side == "sell":
+        return -1
+    return 0
 
 async def smart_route(
-    ex,
+    ex: ccxt.Exchange,
     symbol: str,
     side: str,
     order_type: str,
-    size: Dec,                    # incoming numeric "size" from webhook (base units or a plain number)
-    product_type: str,
-    margin_coin: str,
-    intent: str = "",
-) -> List[Dict[str, Any]]:
-    """
-    - intent="close": reduce-only up to existing amount; if flat, do nothing
-    - intent="dca":   add only in same direction; otherwise ignore
-    - intent="open" or "": apply position/margin rules and (if flat) allow open
-    - never flip: opposite signal closes up to size, no reverse entry in the same call
-    """
-    # Current net (signed base)
-    net = await get_net_position(ex, symbol, product_type, margin_coin)
-    cur_dir = 0 if net == 0 else (1 if net > 0 else -1)
-    new_dir = 1 if side == "buy" else -1
-    out: List[Dict[str, Any]] = []
+    size: float,
+    intent: str,
+    env: dict,
+):
+    if side not in ("buy", "sell"):
+        raise ValueError("invalid side")
+    await ex.load_markets()
+    if symbol not in ex.markets:
+        raise ValueError(f"unsupported symbol: {symbol}")
 
-    # Closing intent
+    pos = await get_position_contracts(ex, symbol)
+    pos_dir = 1 if pos > 0 else (-1 if pos < 0 else 0)
+    side_dir = _side_dir(side)
+
+    # classify when intent is missing
+    inferred = ""
+    if not intent:
+        if pos_dir == 0:
+            # no position: treat as CLOSE-only (ignore) unless opening explicitly allowed
+            inferred = "open"
+        else:
+            if pos_dir == side_dir:
+                inferred = "add"
+            else:
+                inferred = "close"
+        intent = inferred
+
+    # guard: allow shorts or not
+    if not env["ALLOW_SHORTS"] and side == "sell" and pos_dir <= 0 and intent in ("open", "add"):
+        return {"ignored": True, "reason": "shorts disabled"}
+
+    # require explicit open/add when configured
+    if env["REQUIRE_INTENT_FOR_OPEN"] and intent in ("open", "add") and inferred != "add" and pos_dir == 0 and inferred != "open":
+        # shouldn't happen, keep safe
+        intent = "open"
+
+    # max coins guard (only for opening a new coin)
+    if intent == "open" and pos_dir == 0:
+        if await open_coin_count(ex) >= env["MAX_COINS"]:
+            return {"ignored": True, "reason": "max coins reached"}
+
+    # close intent: close all regardless of payload size
     if intent == "close":
-        if net == 0:
-            return out
-        close_side = "buy" if net < 0 else "sell"
-        close_amount = abs(net) if size >= abs(net) else size
-        if close_amount > 0:
-            out.append(await place_reduce_only(ex, symbol, close_side, close_amount, product_type, margin_coin))
-        return out
+        return await close_all(ex, symbol, env)
 
-    # Price and lot-step for quantity calc
-    mark = await get_mark_price(ex, symbol)
-    # Equity and per-entry target margin (fixed fraction of seed/equity)
-    equity = await fetch_balance_usdt_equity(ex)
-    target_margin = Dec(FRACTION_PER_POSITION) * equity  # USDT margin to consume
-    # Convert target margin to base quantity using leverage and current price
-    raw_qty = target_qty_for_margin(target_margin, Dec(LEVERAGE), Dec(mark))
-    qty = await round_size_to_step(ex, symbol, raw_qty)
+    # reduce intent (explicit): reduce by given size (contracts); if size is 0 or invalid, close all
+    if intent == "reduce":
+        if abs(pos) < 1e-12:
+            return {"ignored": True, "reason": "no position"}
+        if size <= 0:
+            return await close_all(ex, symbol, env)
+        reduce_side = "sell" if side_dir > 0 else "buy"
+        amt = min(abs(pos), abs(size))
+        amt = amt * (1.0 + env["CLOSE_TOLERANCE_PCT"])
+        amt = round_amount(ex, symbol, amt)
+        return await create_order(ex, symbol, reduce_side, amt, True, env)
 
-    # DCA intent: only in same direction; do not exceed coin limit
-    if intent == "dca":
-        if cur_dir == 0 or cur_dir == new_dir:
-            # allow even if coin limit reached (it's the same symbol)
-            if qty > 0:
-                out.append(await place_open(ex, symbol, side, qty, product_type, margin_coin))
-        return out
+    # open/add: ignore incoming size and use fixed-fraction sizing
+    if intent in ("open", "add"):
+        amt = await calc_open_amount(ex, symbol, env)
+        if amt <= 0:
+            return {"ignored": True, "reason": "sizing=0"}
+        return await create_order(ex, symbol, side, amt, False, env)
 
-    # Open or unspecified intent
-    if cur_dir == 0:
-        # Respect coin limit (count distinct non-zero symbols)
-        if not await can_open_new_coin(ex, symbol, PRODUCT_TYPE, MARGIN_COIN):
-            return out  # refuse silently when over the limit
-        if qty > 0:
-            out.append(await place_open(ex, symbol, side, qty, product_type, margin_coin))
-        return out
+    # fallback: if side opposes existing position, treat as close
+    if pos_dir != 0 and pos_dir != side_dir:
+        return await close_all(ex, symbol, env)
 
-    # Already have a position
-    if cur_dir == new_dir:
-        # Same direction → this is an add (allowed)
-        if qty > 0:
-            out.append(await place_open(ex, symbol, side, qty, product_type, margin_coin))
-        return out
-
-    # Opposite direction → close-only, no flip in the same call
-    if STRICT_EXIT_ONLY:
-        close_side = "buy" if net < 0 else "sell"
-        close_amount = abs(net) if size >= abs(net) else size
-        if close_amount > 0:
-            out.append(await place_reduce_only(ex, symbol, close_side, close_amount, product_type, margin_coin))
-        return out
-
-    # (If flip were allowed, you'd first close then open; we keep it disabled.)
-    return out
+    # otherwise open safely
+    amt = await calc_open_amount(ex, symbol, env)
+    if amt <= 0:
+        return {"ignored": True, "reason": "sizing=0"}
+    return await create_order(ex, symbol, side, amt, False, env)
