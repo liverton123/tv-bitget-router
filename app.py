@@ -3,8 +3,10 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from trade import make_exchange, normalize_symbol, smart_route
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
-                    format="%(asctime)s | %(levelname)s | %(name)s: %(message)s")
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(name)s: %(message)s"
+)
 log = logging.getLogger("router.app")
 
 SECRET = os.getenv("WEBHOOK_SECRET", "mySecret123!")
@@ -14,14 +16,15 @@ API_PASSWORD = os.getenv("BITGET_API_PASSWORD")
 
 PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "umcbl")
 MARGIN_COIN  = os.getenv("MARGIN_COIN", "USDT")
-
 ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() == "true"
 DRY_RUN      = os.getenv("DRY_RUN", "false").lower() == "true"
-FORCE_FIXED_SIZING = os.getenv("FORCE_FIXED_SIZING", "true").lower() == "true"  # ← TV size 무시
+FORCE_FIXED_SIZING = os.getenv("FORCE_FIXED_SIZING", "true").lower() == "true"
 
-for k, v in [("BITGET_API_KEY", API_KEY),
-             ("BITGET_API_SECRET", API_SECRET),
-             ("BITGET_API_PASSWORD", API_PASSWORD)]:
+for k, v in [
+    ("BITGET_API_KEY", API_KEY),
+    ("BITGET_API_SECRET", API_SECRET),
+    ("BITGET_API_PASSWORD", API_PASSWORD),
+]:
     if not v and not DRY_RUN:
         log.warning("[WARN] %s is empty", k)
 
@@ -44,10 +47,12 @@ async def webhook(request: Request):
     raw_symbol = data.get("symbol")
     side       = str(data.get("side", "")).lower()
     order_type = str(data.get("orderType", "market")).lower()
-    incoming_size = data.get("size")  # 받긴 하지만, FORCE_FIXED_SIZING이면 사용 안 함
+    incoming_size = data.get("size")
 
-    if not raw_symbol: raise HTTPException(status_code=400, detail="missing symbol")
-    if side not in ("buy", "sell"): raise HTTPException(status_code=400, detail="invalid side")
+    if not raw_symbol:
+        raise HTTPException(status_code=400, detail="missing symbol")
+    if side not in ("buy", "sell"):
+        raise HTTPException(status_code=400, detail="invalid side")
     if side == "sell" and not ALLOW_SHORTS:
         return JSONResponse({"ok": False, "reason": "shorts disabled"}, status_code=202)
 
@@ -68,5 +73,7 @@ async def webhook(request: Request):
         log.exception("[ROUTER] unhandled")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        try: await ex.close()
-        except: pass
+        try:
+            await ex.close()
+        except:
+            pass
