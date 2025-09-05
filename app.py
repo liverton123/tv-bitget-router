@@ -8,15 +8,13 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
 log = logging.getLogger("router.app")
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mySecret123!")
-PRODUCT_TYPE   = os.getenv("BITGET_PRODUCT_TYPE", "umcbl")
-MARGIN_COIN    = os.getenv("MARGIN_COIN", "USDT")
 DRY_RUN        = os.getenv("DRY_RUN", "false").lower() == "true"
 
 app = FastAPI()
 
 @app.get("/")
 async def health():
-    return {"ok": True, "productType": PRODUCT_TYPE, "marginCoin": MARGIN_COIN, "dryRun": DRY_RUN}
+    return {"ok": True, "dryRun": DRY_RUN}
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -29,7 +27,7 @@ async def webhook(request: Request):
         raise HTTPException(status_code=401, detail="bad secret")
 
     raw_symbol = data.get("symbol")
-    side = data.get("side")                # "buy" | "sell" | None
+    side = data.get("side")                  # "buy" | "sell" | None
     action = (data.get("action") or "").lower()  # "close" | ""
 
     if not raw_symbol:
