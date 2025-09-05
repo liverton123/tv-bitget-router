@@ -12,11 +12,12 @@ API_KEY = os.getenv("BITGET_API_KEY")
 API_SECRET = os.getenv("BITGET_API_SECRET")
 API_PASSWORD = os.getenv("BITGET_API_PASSWORD")
 
-PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "umcbl")  # umcbl = USDT 무기한
+PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "umcbl")
 MARGIN_COIN  = os.getenv("MARGIN_COIN", "USDT")
 
 ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() == "true"
 DRY_RUN      = os.getenv("DRY_RUN", "false").lower() == "true"
+FORCE_FIXED_SIZING = os.getenv("FORCE_FIXED_SIZING", "true").lower() == "true"  # ← TV size 무시
 
 for k, v in [("BITGET_API_KEY", API_KEY),
              ("BITGET_API_SECRET", API_SECRET),
@@ -43,22 +44,22 @@ async def webhook(request: Request):
     raw_symbol = data.get("symbol")
     side       = str(data.get("side", "")).lower()
     order_type = str(data.get("orderType", "market")).lower()
-    size       = data.get("size")
+    incoming_size = data.get("size")  # 받긴 하지만, FORCE_FIXED_SIZING이면 사용 안 함
 
     if not raw_symbol: raise HTTPException(status_code=400, detail="missing symbol")
     if side not in ("buy", "sell"): raise HTTPException(status_code=400, detail="invalid side")
-    if size is None: raise HTTPException(status_code=400, detail="missing size")
     if side == "sell" and not ALLOW_SHORTS:
         return JSONResponse({"ok": False, "reason": "shorts disabled"}, status_code=202)
 
     symbol = normalize_symbol(raw_symbol)
-    log.info("[ROUTER] incoming => %s %s size=%s", side, symbol, size)
+    log.info("[ROUTER] incoming => %s %s size=%s", side, symbol, incoming_size)
 
     ex = await make_exchange(API_KEY, API_SECRET, API_PASSWORD, DRY_RUN)
     try:
         result = await smart_route(
-            ex=ex, symbol=symbol, side=side, order_type=order_type, size=size,
-            product_type=PRODUCT_TYPE, margin_coin=MARGIN_COIN
+            ex=ex, symbol=symbol, side=side, order_type=order_type,
+            size=incoming_size, product_type=PRODUCT_TYPE, margin_coin=MARGIN_COIN,
+            force_fixed_sizing=FORCE_FIXED_SIZING
         )
         return JSONResponse({"ok": True, "result": result})
     except HTTPException:
