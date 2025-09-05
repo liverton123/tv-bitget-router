@@ -1,1 +1,0 @@
-# Intentionally empty. Symbol normalization is handled in trade.normalize_symbol.
