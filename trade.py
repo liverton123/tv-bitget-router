@@ -4,7 +4,9 @@ from typing import Any, Dict, List
 log = logging.getLogger("router.trade")
 
 DEFAULT_LEVERAGE = int(os.getenv("MAX_LEVERAGE", "10"))
-FRACTION_PER_TRADE = float(os.getenv("FRACTION_PER_TRADE", "0.1"))
+# 1/20 고정
+FRACTION_PER_TRADE = float(os.getenv("FRACTION_PER_TRADE", "0.05"))
+
 FORCE_EQUAL_NOTIONAL = os.getenv("FORCE_EQUAL_NOTIONAL", "false").lower() == "true"
 EQUAL_NOTIONAL_USDT  = float(os.getenv("EQUAL_NOTIONAL_USDT", "100"))
 CLOSE_TOLERANCE_PCT = float(os.getenv("CLOSE_TOLERANCE_PCT", "0.02"))
@@ -35,19 +37,8 @@ async def make_exchange(api_key: str, api_secret: str, password: str, dry_run: b
         log.warning("[DRY_RUN] orders will NOT be sent")
     return ex
 
-# -------- balances & sizing --------
-async def _clamp_by_balance(ex, symbol: str, desired_amount: float) -> float:
-    if desired_amount <= 0: return 0.0
-    bal = await ex.fetch_balance()
-    usdt_free = float(bal.get("USDT", {}).get("free", 0) or bal.get("USDT", {}).get("total", 0) or 0)
-    ticker = await ex.fetch_ticker(symbol)
-    price = float(ticker.get("last") or ticker.get("close") or 0)
-    if price <= 0: return 0.0
-    max_notional = usdt_free * DEFAULT_LEVERAGE
-    max_amount = max_notional / price
-    return max(0.0, min(desired_amount, max_amount))
-
-async def calc_order_size(ex, symbol: str) -> float:
+# --- sizing: 항상 '시드의 1/20' 만큼만 마진 사용 ---
+async def calc_order_size_fixed_fraction(ex, symbol: str) -> float:
     markets = await ex.load_markets()
     m = markets.get(symbol) or {}
     if not m:
@@ -56,50 +47,47 @@ async def calc_order_size(ex, symbol: str) -> float:
         if not m: raise ValueError(f"unknown market {symbol}")
 
     bal = await ex.fetch_balance()
-    usdt = float(bal.get("USDT", {}).get("free", 0) or bal.get("USDT", {}).get("total", 0) or 0)
+    total = float(bal.get("USDT", {}).get("total", 0) or 0)     # 시드(총자산)
+    free  = float(bal.get("USDT", {}).get("free", 0) or 0)      # 사용 가능
     ticker = await ex.fetch_ticker(symbol)
     price = float(ticker.get("last") or ticker.get("close") or 0)
     if price <= 0: raise ValueError("bad price")
 
-    notional = usdt * FRACTION_PER_TRADE * DEFAULT_LEVERAGE
-    if FORCE_EQUAL_NOTIONAL:
-        notional = min(notional, EQUAL_NOTIONAL_USDT)
+    # 목표 마진 (시드의 1/20), free 부족하면 free의 98%로 클램프
+    target_margin = total * FRACTION_PER_TRADE
+    target_margin = min(target_margin, max(0.0, free) * 0.98)
+
+    # 주문 수량 = (목표 마진 * 레버리지) / 가격
+    notional = target_margin * DEFAULT_LEVERAGE
     amount = notional / price
 
+    # 거래소 최소수량/정밀도 적용
     min_amt = float(m.get("limits", {}).get("amount", {}).get("min", 0) or 0)
     if min_amt and amount < min_amt: amount = min_amt
     prec = int(m.get("precision", {}).get("amount", 4))
     amount = float(f"{amount:.{prec}f}")
-    amount = await _clamp_by_balance(ex, symbol, amount)
     return amount
 
-# -------- positions (40019 회피 로직) --------
+# --- positions (40019 회피) ---
 async def _fetch_position_single(ex, symbol: str, product_type: str):
     try:
-        # 단건 조회 (권장)
         return await ex.fetch_position(symbol, {"productType": product_type})
     except Exception as e:
         log.info("fallback to all-position: %s", e)
         return None
 
 async def _fetch_positions_all(ex, product_type: str) -> List[Dict[str, Any]]:
-    # v2 all-position: productType만 보냄 (marginCoin 절대 같이 안 보냄)
     return await ex.fetch_positions(None, {"productType": product_type})
 
 async def get_net_position(ex, symbol: str, product_type: str, margin_coin: str) -> float:
     su = symbol.upper()
-    # 1) 단건
     p = await _fetch_position_single(ex, su, product_type)
     if isinstance(p, dict) and p:
         qty = float(p.get("contracts") or p.get("info", {}).get("total", 0) or 0)
         side = (p.get("side") or p.get("info", {}).get("holdSide", "")).lower()
         return qty if side == "long" else (-qty if side == "short" else 0.0)
-    # 2) 전체 후 필터
-    try:
-        positions = await _fetch_positions_all(ex, product_type)
-    except Exception as e:
-        log.error("[CCXT_ERROR] fetch_positions failed: %s", e)
-        raise
+
+    positions = await _fetch_positions_all(ex, product_type)
     net = 0.0
     for px in positions or []:
         psym = (px.get("symbol") or px.get("info", {}).get("symbol", "")).upper()
@@ -110,7 +98,7 @@ async def get_net_position(ex, symbol: str, product_type: str, margin_coin: str)
         if side == "short": net -= qty
     return net
 
-# -------- order --------
+# --- order ---
 async def place_order(ex, symbol: str, side: str, size: float,
                       reduce_only: bool, order_type: str,
                       product_type: str, margin_coin: str):
@@ -120,21 +108,19 @@ async def place_order(ex, symbol: str, side: str, size: float,
     if DRY_RUN:
         log.info("[DRY_RUN] %s %s size=%s reduceOnly=%s", side, symbol, qty, reduce_only)
         return {"dry_run": True, "side": side, "symbol": symbol, "size": qty, "reduceOnly": reduce_only}
-    try:
-        params = {"reduceOnly": reduce_only, "productType": product_type, "marginCoin": margin_coin}
-        return await ex.create_order(symbol=symbol, type=order_type, side=side,
-                                     amount=qty, price=None, params=params)
-    except ccxt.InsufficientFunds as e:
-        log.error("[CCXT_ERROR] insufficient funds: %s", e)
-        raise
-    except ccxt.ExchangeError as e:
-        log.error("[CCXT_ERROR] %s", e)
-        raise
+    params = {"reduceOnly": reduce_only, "productType": product_type, "marginCoin": margin_coin}
+    return await ex.create_order(symbol=symbol, type=order_type, side=side,
+                                 amount=qty, price=None, params=params)
 
 async def smart_route(ex, symbol: str, side: str, order_type: str, size: float,
-                      product_type: str, margin_coin: str):
-    size = float(size) if size not in (None, "", "0") else 0.0
-    if size <= 0: size = await calc_order_size(ex, symbol)
+                      product_type: str, margin_coin: str, force_fixed_sizing: bool):
+    # size 강제 재계산(시그널 값 무시)
+    if force_fixed_sizing:
+        size = await calc_order_size_fixed_fraction(ex, symbol)
+    else:
+        size = float(size) if size not in (None, "", "0") else 0.0
+        if size <= 0:
+            size = await calc_order_size_fixed_fraction(ex, symbol)
 
     net = await get_net_position(ex, symbol, product_type, margin_coin)
     log.info("[ROUTER] net=%s incoming=%s size=%s", net, side, size)
