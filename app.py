@@ -1,51 +1,45 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
 import os
-
-from trade import (
-    get_exchange,
-    close_exchange,
-    smart_route,
-)
+from fastapi import FastAPI, Request, HTTPException
+from pydantic import BaseModel, Field
+from typing import Optional
+from trade import smart_route
 
 app = FastAPI()
 
-class Alert(BaseModel):
-    secret: str
-    symbol: str = Field(..., pattern=r"^[A-Z0-9/:\-_.]+$")
-    side: str = Field(..., pattern=r"^(?i)(buy|sell|close)$")
-    orderType: str = Field(..., pattern=r"^(?i)(market|limit)$")
-    size: float
-    intent: str | None = Field(default=None, pattern=r"^(?i)(open|close|scale_in|scale_out|auto)$")
-    product_type: str | None = None  # e.g. umcbl / dmcbl (case-insensitive)
-
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "umcbl")
 REENTER_ON_OPPOSITE = os.getenv("REENTER_ON_OPPOSITE", "false").lower() == "true"
 REQUIRE_INTENT_FOR_OPEN = os.getenv("REQUIRE_INTENT_FOR_OPEN", "true").lower() == "true"
+REQUIRE_INTENT_FOR_ADD = os.getenv("REQUIRE_INTENT_FOR_ADD", "true").lower() == "true"
+IGNORE_CLOSE_WHEN_FLAT = os.getenv("IGNORE_CLOSE_WHEN_FLAT", "true").lower() == "true"
+ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() == "true"
+
+class Alert(BaseModel):
+    secret: str
+    symbol: str
+    side: str = Field(..., pattern="^(?i)(buy|sell)$")
+    orderType: str = Field(..., pattern="^(?i)(market|limit)$")
+    size: float
+    intent: Optional[str] = Field(None, pattern="^(?i)(open|add|close|flip|auto)$")
 
 @app.post("/webhook")
-async def webhook(alert: Alert):
-    if WEBHOOK_SECRET and alert.secret != WEBHOOK_SECRET:
+async def webhook(payload: Alert, request: Request):
+    if WEBHOOK_SECRET and payload.secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="bad secret")
 
-    ex = await get_exchange()
-    try:
-        product_type = alert.product_type or os.getenv("BITGET_PRODUCT_TYPE", "umcbl")
-        result = await smart_route(
-            ex=ex,
-            symbol=alert.symbol,
-            side=alert.side,
-            order_type=alert.orderType,
-            size=alert.size,
-            intent=alert.intent,
-            reenter_on_opposite=REENTER_ON_OPPOSITE,
-            product_type=product_type,
-            require_intent_for_open=REQUIRE_INTENT_FOR_OPEN,
-        )
-        return {"ok": True, "result": result}
-    finally:
-        await close_exchange(ex)
-
-@app.get("/")
-async def root():
-    return {"status": "ok"}
+    result = await smart_route(
+        symbol=payload.symbol,
+        side=payload.side.lower(),
+        order_type=payload.orderType.lower(),
+        size=payload.size,
+        intent=(payload.intent or "auto").lower(),
+        product_type=PRODUCT_TYPE,
+        flags={
+            "REENTER_ON_OPPOSITE": REENTER_ON_OPPOSITE,
+            "REQUIRE_INTENT_FOR_OPEN": REQUIRE_INTENT_FOR_OPEN,
+            "REQUIRE_INTENT_FOR_ADD": REQUIRE_INTENT_FOR_ADD,
+            "IGNORE_CLOSE_WHEN_FLAT": IGNORE_CLOSE_WHEN_FLAT,
+            "ALLOW_SHORTS": ALLOW_SHORTS,
+        },
+    )
+    return {"ok": True, "result": result}
