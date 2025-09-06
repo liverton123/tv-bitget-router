@@ -1,116 +1,119 @@
 import os
-import logging
-from typing import Any, Dict, Optional
+from typing import Optional, Dict, Any
 
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field
+import ccxt.async_support as ccxt
 
-import ccxt.async_support as ccxt  # asyncio version
-from trade import smart_route, normalize_symbol
+from trade import smart_route
 
-log = logging.getLogger("router.app")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+APP_PORT = int(os.getenv("PORT", "10000"))
 
-# ---- env ----
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-BITGET_API_KEY = os.getenv("BITGET_API_KEY", "")
-BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "")
-BITGET_API_PASSWORD = os.getenv("BITGET_API_PASSWORD", "")
-BITGET_PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "umcbl")  # USDT-M: umcbl
+BITGET_API_KEY = os.getenv("BITGET_API_KEY")
+BITGET_API_SECRET = os.getenv("BITGET_API_SECRET")
+BITGET_API_PASSWORD = os.getenv("BITGET_API_PASSWORD")
+PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "umcbl")  # umcbl (USDT-M)
+MARGIN_COIN = os.getenv("MARGIN_COIN", "USDT")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mySecret123")
 REQUIRE_INTENT_FOR_OPEN = os.getenv("REQUIRE_INTENT_FOR_OPEN", "true").lower() == "true"
 
-if not (BITGET_API_KEY and BITGET_API_SECRET and BITGET_API_PASSWORD):
-    log.warning("Bitget API credentials are missing")
-
 app = FastAPI()
+ex: ccxt.Exchange | None = None
 
-class Webhook(BaseModel):
-    secret: str
-    symbol: str
-    side: str
-    orderType: str = Field("market", alias="orderType")
+
+class Alert(BaseModel):
+    secret: str = Field(...)
+    symbol: str = Field(..., description="e.g. LINKUSDT.P or LINK/USDT:USDT")
+    side: str = Field(..., regex="^(?i)(buy|sell)$")
+    orderType: Optional[str] = Field("market", alias="orderType")
     size: Optional[float] = 0.0
-    intent: Optional[str] = None  # "open" | "add" | "close"
+    intent: Optional[str] = Field(None, description="open | add | close")
 
-    @validator("side")
-    def v_side(cls, v: str) -> str:
-        v = v.lower()
-        if v not in ("buy", "sell"):
-            raise ValueError("side must be buy or sell")
-        return v
+    class Config:
+        allow_population_by_field_name = True
 
-    @validator("orderType")
-    def v_ot(cls, v: str) -> str:
-        if v.lower() != "market":
-            raise ValueError("only market supported")
-        return v.lower()
+
+def normalize_symbol(raw: str) -> str:
+    s = raw.strip().upper()
+    if s.endswith(".P"):
+        s = s[:-2]
+    if "/" in s and ":USDT" in s:
+        return s  # already unified
+    if s.endswith("USDT"):
+        base = s[:-4]
+        return f"{base}/USDT:USDT"
+    # fallback: assume base only
+    return f"{s}/USDT:USDT"
+
 
 @app.on_event("startup")
-async def _startup() -> None:
-    pass
-
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    pass
-
-def build_exchange() -> ccxt.bitget:
+async def startup() -> None:
+    global ex
     ex = ccxt.bitget({
         "apiKey": BITGET_API_KEY,
         "secret": BITGET_API_SECRET,
         "password": BITGET_API_PASSWORD,
         "enableRateLimit": True,
         "options": {
-            "defaultType": "swap",  # futures
-            "defaultSettle": "usdt",
-            # bitget positions/fetch require productType when calling raw; ccxt handles it if defaultType swap
+            "defaultType": "swap",
+            "defaultSettle": "USDT",
+            "defaultMarginMode": "cross",
         },
     })
-    return ex
+    await ex.load_markets()
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    if ex:
+        await ex.close()
+
 
 @app.post("/webhook")
 async def webhook(req: Request) -> Dict[str, Any]:
     try:
         payload = await req.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+        raise HTTPException(status_code=400, detail="invalid json")
 
     try:
-        data = Webhook(**payload)
+        alert = Alert(**payload)
     except Exception as e:
-        log.info("payload validation error: %s", e)
-        raise HTTPException(status_code=400, detail=f"Bad payload: {e}")
+        raise HTTPException(status_code=400, detail=f"bad payload: {e}")
 
-    if WEBHOOK_SECRET and data.secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if alert.secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="bad secret")
 
-    # normalize incoming symbol to ccxt unified
-    unified_symbol = normalize_symbol(data.symbol)
+    if ex is None:
+        raise HTTPException(status_code=503, detail="exchange not ready")
 
-    # block accidental opens if the alert wasn't explicit
-    if REQUIRE_INTENT_FOR_OPEN and (data.intent or "").lower() not in ("open", "add", "close"):
-        log.info("[ROUTER] ignored: missing/unknown intent for %s", unified_symbol)
-        return {"status": "ignored", "reason": "missing/unknown intent"}
+    symbol = normalize_symbol(alert.symbol)
+    side = alert.side.lower()
+    intent = (alert.intent or "").lower()
 
-    intent = (data.intent or "").lower() or "open"
+    # Optional guard: without intent we only allow add/close when position exists (handled in trade.smart_route).
+    # To be extra safe, when no position and REQUIRE_INTENT_FOR_OPEN is true, block if intent != open.
+    if REQUIRE_INTENT_FOR_OPEN and intent != "open":
+        # trade.smart_route will still do final checks based on position state
+        pass
 
-    ex = build_exchange()
     try:
-        res = await smart_route(
+        result = await smart_route(
             ex=ex,
-            unified_symbol=unified_symbol,
-            side=data.side,
-            order_type=data.orderType,
-            incoming_size=float(data.size or 0),
-            intent=intent,
-            product_type=BITGET_PRODUCT_TYPE,
+            unified_symbol=symbol,
+            side=side,
+            order_type=(alert.orderType or "market").lower(),
+            incoming_size=float(alert.size or 0.0),
+            intent=intent or None,
+            product_type=PRODUCT_TYPE,
         )
-        return {"status": "ok", "result": res}
-    finally:
-        try:
-            await ex.close()
-        except Exception:
-            pass
+        return {"ok": True, **result}
+    except ccxt.BaseError as ce:
+        return {"ok": False, "error": "ccxt", "message": str(ce)}
+    except Exception as e:
+        return {"ok": False, "error": "unhandled", "message": str(e)}
+
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), log_level="info")
+    uvicorn.run("app:app", host="0.0.0.0", port=APP_PORT, workers=1)
