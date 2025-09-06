@@ -1,93 +1,97 @@
+# app.py
 import os
-import json
 import logging
-from typing import Optional, Dict, Any
-
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, validator
+import uvicorn
 
-from trade import smart_route  # uses your existing trade.py
+from trade import smart_route
 
-# ---- Logging ----
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("router.app")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
-# ---- Env ----
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mySecret123")
-REENTER_ON_OPPOSITE = os.getenv("REENTER_ON_OPPOSITE", "false").lower() == "true"
-
-# ---- Pydantic models (Pydantic v2) ----
-class Alert(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
-
-    secret: str = Field(...)
-    symbol: str = Field(..., description="e.g. BTCUSDT.P or BTC/USDT:USDT")
-    side: str = Field(..., pattern="^(?i)(buy|sell)$")
-    orderType: Optional[str] = Field("market", alias="orderType")
-    size: Optional[float] = 0.0
-    intent: Optional[str] = Field(
-        None, description="open | add | close (explicit intent from strategy, optional)"
-    )
-
-# ---- FastAPI ----
 app = FastAPI()
 
+# --- env ---
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() == "true"
+REENTER_ON_OPPOSITE = os.getenv("REENTER_ON_OPPOSITE", "false").lower() == "true"
+PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "umcbl")  # <- required by smart_route
 
-def normalize_symbol(s: str) -> str:
-    """Accepts forms like LINKUSDT.P, LINK/USDT:USDT, LINKUSDT:USDT and returns CCXT market id LINK/USDT:USDT."""
-    s = s.strip().upper()
-    if s.endswith(".P"):
-        s = s[:-2]
-    if "/" in s and ":" in s:
-        return s
-    if ":" in s and "/" not in s:
-        base_quote, margin = s.split(":")
-        return f"{base_quote[:-4]}/{base_quote[-4:]}:{margin}"
-    if s.endswith("USDT"):
-        base = s[:-4]
-        return f"{base}/USDT:USDT"
-    return s
+# --- models (Pydantic v2) ---
+class Alert(BaseModel):
+    secret: str
+    symbol: str = Field(..., min_length=3)
+    side: str = Field(..., pattern=r"(?i)^(buy|sell)$")
+    orderType: str = Field(..., pattern=r"(?i)^(market|limit)$")
+    size: float
+    intent: str | None = Field(None, pattern=r"(?i)^(open|add|close|auto)$")
 
+    @validator("symbol")
+    def normalize_symbol(cls, v: str) -> str:
+        # Accept "W/USDT", "WUSDT", "WUSDT:USDT" -> normalize to "WUSDT:USDT"
+        s = v.replace("/", "").upper()
+        if not s.endswith("USDT"):
+            raise ValueError("symbol must be *USDT market")
+        return f"{s}:USDT"
 
-@app.get("/")
-async def health() -> Dict[str, str]:
-    return {"status": "ok"}
+    @validator("side")
+    def norm_side(cls, v: str) -> str:
+        return v.lower()
+
+    @validator("orderType")
+    def norm_ot(cls, v: str) -> str:
+        return v.lower()
+
+    @validator("intent")
+    def norm_intent(cls, v: str | None) -> str | None:
+        return v.lower() if v else None
 
 
 @app.post("/webhook")
-async def webhook(req: Request) -> JSONResponse:
+async def webhook(req: Request):
     try:
-        payload: Any = await req.json()
+        body = await req.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     try:
-        alert = Alert.model_validate(payload if isinstance(payload, dict) else json.loads(payload))
+        alert = Alert(**body)
     except Exception as e:
-        log.exception("Alert validation failed")
-        raise HTTPException(status_code=400, detail=f"Validation error: {e}")
+        log.error("ALERT parse error: %s", e)
+        raise HTTPException(status_code=400, detail=f"Bad alert: {e}")
 
-    if alert.secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if WEBHOOK_SECRET and alert.secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
-    symbol = normalize_symbol(alert.symbol)
-    side = alert.side.lower()  # 'buy' | 'sell'
-    order_type = (alert.orderType or "market").lower()
-    size = float(alert.size or 0.0)
-    intent = (alert.intent or "").lower()  # '', 'open', 'add', 'close'
+    symbol = alert.symbol           # e.g. WUSDT:USDT
+    side = alert.side               # "buy" | "sell"
+    order_type = alert.orderType    # "market" | "limit"
+    size = float(alert.size)
+    intent = alert.intent or "auto" # "open" | "add" | "close" | "auto"
 
-    log.info('router.app:[ROUTER] incoming => %s %s size=%.8g intent=%s', side, symbol, size, intent or "auto")
+    log.info("incoming => %s %s size=%s intent=%s", side, symbol, size, intent)
+
+    # Disallow shorts if configured
+    if not ALLOW_SHORTS and side == "sell" and intent in ("open", "auto"):
+        log.info("shorts disabled: ignoring")
+        return {"ok": True, "skipped": "shorts_disabled"}
 
     try:
-        # Delegate to trading logic. smart_route must:
-        # - infer intent when not provided
-        # - ignore pure close signals when no position exists
-        # - respect sizing/limits per your trade.py
-        result = await smart_route(symbol, side, order_type, size, intent, REENTER_ON_OPPOSITE)
-        return JSONResponse({"ok": True, "result": result})
-    except HTTPException:
-        raise
+        result = await smart_route(
+            symbol=symbol,
+            side=side,
+            order_type=order_type,
+            size=size,
+            intent=intent,
+            reenter_on_opposite=REENTER_ON_OPPOSITE,
+            product_type=PRODUCT_TYPE,  # <-- critical fix
+        )
+        return {"ok": True, "result": result}
     except Exception as e:
-        log.exception("router.app:[ROUTER] unhandled")
+        log.error("unhandled", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
