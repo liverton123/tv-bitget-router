@@ -1,242 +1,122 @@
 import os
-import math
-import asyncio
-from typing import Any, Dict, List, Tuple, Optional
-
+import re
+from typing import Dict, Any, Optional, Tuple
 import ccxt.async_support as ccxt
 
+API_KEY = os.getenv("BITGET_API_KEY", "")
+API_SECRET = os.getenv("BITGET_API_SECRET", "")
+API_PASS = os.getenv("BITGET_API_PASSWORD", "")
+CLOSE_TOLERANCE_PCT = float(os.getenv("CLOSE_TOLERANCE_PCT", "0.02"))
 
-# ---------- exchange lifecycle ----------
+def normalize_symbol(sym: str) -> str:
+    s = sym.upper().strip()
+    if re.match(r"^[A-Z0-9]+USDT(\.P)?$", s):
+        base = s.replace(".P", "").replace("USDT", "")
+        return f"{base}/USDT:USDT"
+    return s
 
-async def get_exchange():
-    api_key = os.getenv("BITGET_API_KEY")
-    secret = os.getenv("BITGET_API_SECRET")
-    password = (
-        os.getenv("BITGET_PASSWORD")
-        or os.getenv("BITGET_API_PASSWORD")
-        or os.getenv("BITGET_PASSPHRASE")
-    )
-    if not api_key or not secret or not password:
-        missing = []
-        if not api_key: missing.append("BITGET_API_KEY")
-        if not secret: missing.append("BITGET_API_SECRET")
-        if not password: missing.append("BITGET_PASSWORD|BITGET_API_PASSWORD|BITGET_PASSPHRASE")
-        raise RuntimeError(f"Missing Bitget credentials: {', '.join(missing)}")
-
+async def get_exchange(product_type: str):
     ex = ccxt.bitget({
-        "apiKey": api_key,
-        "secret": secret,
-        "password": password,
-        "enableRateLimit": True,
+        "apiKey": API_KEY,
+        "secret": API_SECRET,
+        "password": API_PASS,
         "options": {
-            "defaultType": "swap",  # USDT-margined perpetuals
+            "defaultType": "swap",
+            "defaultSubType": "linear",
+            "productType": product_type,
         },
+        "enableRateLimit": True,
     })
     await ex.load_markets()
     return ex
 
-
-async def close_exchange(ex):
-    try:
-        if ex is not None:
-            await ex.close()
-    except Exception:
-        pass
-
-
-# ---------- symbol helpers ----------
-
-def normalize_symbol_for_bitget(sym: str) -> str:
-    # Examples:
-    #  "BTCUSDT.P" -> "BTC/USDT:USDT"
-    #  "BTC/USDT:USDT" -> unchanged
-    s = sym.replace("-", "").replace("_", "").upper()
-    if "/" in sym and ":" in sym:
-        return sym  # already normalized
-    if s.endswith("USDT.P") or s.endswith("USDT:USDT"):
-        base = s.split("USDT")[0]
-        return f"{base}/USDT:USDT"
-    if s.endswith("USDT"):
-        base = s[:-4]
-        return f"{base}/USDT:USDT"
-    # fallback: let ccxt try to map it
-    return sym
-
-
-def norm_side(side: str) -> str:
-    return side.lower()
-
-
-def norm_intent(intent: Optional[str]) -> Optional[str]:
-    return intent.lower() if intent else None
-
-
-def norm_order_type(order_type: str) -> str:
-    return order_type.lower()
-
-
-def norm_product_type(product_type: str | None) -> str:
-    if not product_type:
-        return "umcbl"
-    return product_type.lower()
-
-
-# ---------- positions & sizing ----------
-
-async def fetch_symbol_positions(ex, symbol: str, product_type: str) -> List[Dict[str, Any]]:
+async def fetch_symbol_positions(ex, symbol: Optional[str], product_type: str):
     params = {"productType": product_type}
-    try:
-        # ccxt will call GET /api/mix/v2/position/allPosition under the hood for bitget
-        pos = await ex.fetch_positions(None, params)
-        if not pos:
-            return []
-        sym_norm = symbol
-        out = []
-        for p in pos:
-            if p.get("symbol") == sym_norm or p.get("info", {}).get("symbol") == sym_norm:
-                out.append(p)
-            # Some drivers return unified symbol in "symbol" != info.symbol; accept either exact unified match
-            if p.get("symbol") and p.get("symbol").upper() == sym_norm.upper():
-                if p not in out:
-                    out.append(p)
-        return out
-    except Exception:
-        # if exchange doesn't filter, still return all and let getter compute net
-        return []
+    positions = await ex.fetch_positions([symbol] if symbol else None, params)
+    return positions
 
+def position_side_and_size(positions) -> Tuple[str, float]:
+    if not positions:
+        return "flat", 0.0
+    p = positions[0]
+    contracts = float(p.get("contracts", 0) or 0)
+    if contracts <= 0:
+        return "flat", 0.0
+    return p.get("side", "flat"), contracts
 
-def net_from_positions(positions: List[Dict[str, Any]]) -> Tuple[float, str]:
-    """
-    Returns (net_contracts, direction) where direction in {'long','short','flat'}.
-    Contracts can be float; positive means long, negative short.
-    """
-    net = 0.0
-    for p in positions:
-        side = p.get("side") or p.get("positionSide")
-        contracts = p.get("contracts") or p.get("contractSize") or p.get("info", {}).get("total")
-        if contracts is None:
-            # fallbacks: size in base
-            contracts = p.get("contracts") or p.get("size") or 0.0
-        try:
-            qty = float(contracts)
-        except Exception:
-            qty = 0.0
-        if (side or "").lower() == "long":
-            net += qty
-        elif (side or "").lower() == "short":
-            net -= qty
-        else:
-            # one-way mode may report only one row; treat as net if size>0 and 'side' in info
-            raw_side = (p.get("info", {}).get("holdSide") or p.get("info", {}).get("side") or "").lower()
-            if raw_side == "long":
-                net += qty
-            elif raw_side == "short":
-                net -= qty
-    if abs(net) < 1e-9:
-        return 0.0, "flat"
-    return (abs(net), "long" if net > 0 else "short")
-
-
-# ---------- orders ----------
-
-async def place_market(ex, symbol: str, side: str, amount: float, reduce_only: bool):
-    params = {"reduceOnly": reduce_only}
-    return await ex.create_order(symbol, "market", side, amount, None, params)
-
-
-# ---------- router ----------
+async def market_order(ex, symbol: str, side: str, size: float, reduce_only: bool):
+    params: Dict[str, Any] = {"reduceOnly": reduce_only}
+    return await ex.create_order(symbol, "market", side, size, None, params)
 
 async def smart_route(
-    ex,
     symbol: str,
-    side: str,
-    order_type: str,
+    side: str,                 # "buy" | "sell"
+    order_type: str,           # must be "market"
     size: float,
-    intent: Optional[str],
-    reenter_on_opposite: bool,
+    intent: str,               # "open" | "add" | "close" | "flip" | "auto"
     product_type: str,
-    require_intent_for_open: bool,
-) -> Dict[str, Any]:
-    """
-    - Distinguishes open/close/scale_in/scale_out.
-    - If intent is 'close', closes any existing position only (no new entry).
-    - If require_intent_for_open=True and intent is None/auto/close/scale_out, will never open.
-    - If no position exists and we receive a 'close' -> no-op.
-    - Never flips side implicitly; if opposite signal comes and intent!=open/scale_in, it will only try reduce-only.
-    """
-    sym = normalize_symbol_for_bitget(symbol)
-    s = norm_side(side)
-    i = norm_intent(intent)
-    ot = norm_order_type(order_type)
-    pt = norm_product_type(product_type)
+    flags: Dict[str, bool],
+):
+    assert order_type == "market", "only market supported"
 
-    if ot != "market":
-        # keep implementation simple; only market supported here
-        ot = "market"
+    sym = normalize_symbol(symbol)
+    ex = await get_exchange(product_type)
+    try:
+        positions = await fetch_symbol_positions(ex, sym, product_type)
+        pos_side, pos_size = position_side_and_size(positions)
+        side_dir = "long" if side == "buy" else "short"
 
-    # load markets already done in get_exchange
-    # get positions
-    positions = await fetch_symbol_positions(ex, sym, pt)
-    net_qty, net_dir = net_from_positions(positions)
+        if side_dir == "short" and not flags.get("ALLOW_SHORTS", True):
+            return {"skipped": "shorts_disabled"}
 
-    # helper flags
-    wants_open = i in {"open", "scale_in"} or (i == "auto" and not require_intent_for_open)
-    wants_close_only = i in {"close", "scale_out"} or (i == "auto" and not wants_open)
-
-    # If explicit close
-    if i == "close":
-        if net_dir == "flat":
-            return {"action": "close", "status": "no_position"}
-        # close entire net with reduceOnly
-        close_side = "sell" if net_dir == "long" else "buy"
-        amt = net_qty
-        if amt <= 0:
-            return {"action": "close", "status": "no_position"}
-        order = await place_market(ex, sym, close_side, amt, True)
-        return {"action": "close", "status": "filled", "order": order}
-
-    # Scale out: reduce up to `size`, capped by net
-    if i == "scale_out":
-        if net_dir == "flat":
-            return {"action": "scale_out", "status": "no_position"}
-        reduce_side = "sell" if net_dir == "long" else "buy"
-        amt = min(size, net_qty)
-        if amt <= 0:
-            return {"action": "scale_out", "status": "no_position"}
-        order = await place_market(ex, sym, reduce_side, amt, True)
-        return {"action": "scale_out", "status": "filled", "order": order}
-
-    # At this point: i in {open, scale_in} or i is None/auto
-    if require_intent_for_open and not wants_open:
-        # Do not open. If there is an opposite signal and we have a position, reduce-only up to `size`.
-        if wants_close_only and net_dir != "flat":
-            reduce_side = "sell" if net_dir == "long" else "buy"
-            amt = min(size, net_qty)
-            if amt > 0:
-                order = await place_market(ex, sym, reduce_side, amt, True)
-                return {"action": "reduce_only", "status": "filled", "order": order}
-        return {"action": "ignored_open", "reason": "intent_required"}
-
-    # We are allowed to open/scale-in
-    # Decide requested direction from signal side
-    req_dir = "long" if s == "buy" else "short" if s == "sell" else "flat"
-
-    # If there is an opposite net and reenter_on_opposite is False, close first, do not flip
-    if net_dir != "flat" and net_dir != req_dir:
-        if not reenter_on_opposite:
-            # Just close, no new entry
-            close_side = "sell" if net_dir == "long" else "buy"
-            order = await place_market(ex, sym, close_side, net_qty, True)
-            return {"action": "close_on_opposite", "status": "filled", "order": order}
+        if intent == "auto":
+            if pos_side == "flat":
+                action = "open"
+            elif pos_side == side_dir:
+                action = "add"
+            else:
+                action = "flip" if flags.get("REENTER_ON_OPPOSITE", False) else "close"
         else:
-            # Close then open requested side
-            close_side = "sell" if net_dir == "long" else "buy"
-            _ = await place_market(ex, sym, close_side, net_qty, True)
-            open_side = "buy" if req_dir == "long" else "sell"
-            order = await place_market(ex, sym, open_side, size, False)
-            return {"action": "flip", "status": "filled", "order": order}
+            action = intent
 
-    # Same direction or flat -> open/scale-in
-    open_side = "buy" if req_dir == "long" else "sell"
-    order = await place_market(ex, sym, open_side, size, False)
-    return {"action": "open" if net_dir == "flat" else "scale_in", "status": "filled", "order": order}
+        if action == "open" and flags.get("REQUIRE_INTENT_FOR_OPEN", True) and intent != "open":
+            return {"skipped": "open_requires_intent"}
+        if action == "add" and flags.get("REQUIRE_INTENT_FOR_ADD", True) and intent != "add":
+            return {"skipped": "add_requires_intent"}
+        if action == "close" and pos_side == "flat" and flags.get("IGNORE_CLOSE_WHEN_FLAT", True):
+            return {"skipped": "flat_close_ignored"}
+
+        if action == "open":
+            if pos_side != "flat":
+                return {"skipped": "already_in_position"}
+            order = await market_order(ex, sym, side, size, reduce_only=False)
+            return {"executed": "open", "order": order}
+
+        if action == "add":
+            if pos_side != side_dir:
+                return {"skipped": "add_wrong_side_or_flat"}
+            order = await market_order(ex, sym, side, size, reduce_only=False)
+            return {"executed": "add", "order": order}
+
+        if action == "close":
+            if pos_side == "flat":
+                return {"skipped": "flat_close_ignored"}
+            close_side = "sell" if pos_side == "long" else "buy"
+            qty = max(size, pos_size * (1 - CLOSE_TOLERANCE_PCT))
+            order = await market_order(ex, sym, close_side, qty, reduce_only=True)
+            return {"executed": "close", "order": order}
+
+        if action == "flip":
+            if pos_side != "flat":
+                close_side = "sell" if pos_side == "long" else "buy"
+                await market_order(ex, sym, close_side, pos_size, reduce_only=True)
+            order = await market_order(ex, sym, side, size, reduce_only=False)
+            return {"executed": "flip", "order": order}
+
+        return {"skipped": "unknown_action"}
+
+    finally:
+        try:
+            await ex.close()
+        except Exception:
+            pass
