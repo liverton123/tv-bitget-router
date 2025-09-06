@@ -1,167 +1,163 @@
+# trade.py
 import os
-from typing import Any, Dict, List, Tuple
-
+import math
 import ccxt.async_support as ccxt
+from typing import Optional, Dict, Any, List
 
+
+BITGET_API_KEY = os.getenv("BITGET_API_KEY", "")
+BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "")
+BITGET_PASSWORD = os.getenv("BITGET_PASSWORD", "")
+DEFAULT_PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "umcbl")  # USDT-M perp
 ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() == "true"
-MAX_COINS = int(os.getenv("MAX_COINS", "5"))
-FORCE_FIXED_SIZING = os.getenv("FORCE_FIXED_SIZING", "true").lower() == "true"
-FRACTION_PER_POSITION = float(os.getenv("FRACTION_PER_POSITION", "0.05"))
-REENTER_ON_OPPOSITE = os.getenv("REENTER_ON_OPPOSITE", "false").lower() == "true"
-MARGIN_COIN = os.getenv("MARGIN_COIN", "USDT")
 
 
-async def _active_symbols(ex: ccxt.Exchange, product_type: str) -> List[str]:
-    positions = await ex.fetch_positions(params={"productType": product_type})
-    act: List[str] = []
-    for p in positions or []:
-        amt = abs(float(p.get("contracts") or p.get("contractSize") or p.get("size") or 0))
-        if amt > 0:
-            act.append(p["symbol"])
-    # unique by base symbol
-    uniq = []
-    seen = set()
-    for s in act:
-        base = s.split("/")[0]
-        if base not in seen:
-            seen.add(base)
-            uniq.append(s)
-    return uniq
+# ---------- Exchange bootstrap ----------
+
+async def get_exchange():
+    ex = ccxt.bitget({
+        "apiKey": BITGET_API_KEY,
+        "secret": BITGET_API_SECRET,
+        "password": BITGET_PASSWORD,
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": "swap",  # perps
+        },
+    })
+    await ex.load_markets()
+    return ex
 
 
-async def _position_size_side(ex: ccxt.Exchange, symbol: str, product_type: str) -> Tuple[float, str | None]:
-    ps = await ex.fetch_positions([symbol], params={"productType": product_type})
-    amt = 0.0
-    side = None
-    for p in ps or []:
-        contracts = float(p.get("contracts") or p.get("contractSize") or p.get("size") or 0.0)
-        if contracts != 0:
-            amt = abs(contracts)
-            side = "long" if contracts > 0 else "short"
-            break
-    return amt, side
+# ---------- Utilities ----------
+
+def normalize_symbol(sym: str) -> str:
+    s = sym.strip().upper()
+    if s.endswith(".P"):
+        s = s[:-2]
+    if s.endswith(":USDT"):
+        s = s.replace(":USDT", "")
+    if s.endswith("USDT"):
+        base = s[:-4]
+        return f"{base}/USDT:USDT"
+    if "/" in s and ":USDT" in s:
+        return s
+    # fallback, let ccxt validate later
+    return s
 
 
-async def _ticker_price(ex: ccxt.Exchange, symbol: str) -> float:
-    t = await ex.fetch_ticker(symbol)
-    price = float(t.get("last") or t.get("close") or 0.0)
-    if price <= 0:
-        raise ValueError(f"no price for {symbol}")
-    return price
+def _position_to_net_contracts(positions: List[Dict[str, Any]]) -> float:
+    net = 0.0
+    for p in positions:
+        side = (p.get("side") or "").lower()
+        contracts = float(p.get("contracts") or p.get("contractSize") or 0)  # ccxt normalizes to "contracts"
+        if side == "long":
+            net += contracts
+        elif side == "short":
+            net -= contracts
+    return net
 
 
-async def _account_equity(ex: ccxt.Exchange) -> float:
-    bal = await ex.fetch_balance()
-    usdt = bal.get("USDT") or {}
-    total = float(usdt.get("total") or usdt.get("free") or 0.0)
-    if total <= 0:
-        # as a fallback, try info path
-        total = float(bal.get("total", {}).get("USDT", 0.0))
-    return total
+async def fetch_symbol_positions(ex, symbol: str, product_type: str) -> List[Dict[str, Any]]:
+    params = {"productType": product_type}
+    try:
+        pos = await ex.fetch_positions([symbol], params)
+    except Exception:
+        # some ccxt versions expect without list
+        pos = await ex.fetch_positions(None, params)
+        pos = [p for p in pos if p.get("symbol") == symbol]
+    return pos
 
 
-async def _leverage_for_symbol(ex: ccxt.Exchange, symbol: str) -> float:
-    m = ex.markets.get(symbol) or {}
-    lev = float(m.get("limits", {}).get("leverage", {}).get("max", 10))  # fallback to 10x
-    # we do not change leverage here; assume it is already set on the venue
-    return max(1.0, lev)
+async def get_net_position(ex, symbol: str, product_type: str) -> float:
+    pos = await fetch_symbol_positions(ex, symbol, product_type)
+    return _position_to_net_contracts(pos)
 
 
-async def _compute_order_qty(ex: ccxt.Exchange, symbol: str) -> float:
-    equity = await _account_equity(ex)
-    if equity <= 0:
-        raise ValueError("equity is zero")
-    price = await _ticker_price(ex, symbol)
-    lev = await _leverage_for_symbol(ex, symbol)
-    # Target initial margin = equity * FRACTION_PER_POSITION
-    # quantity = margin * leverage / price
-    margin_target = equity * FRACTION_PER_POSITION
-    qty = (margin_target * lev) / price
-    # round to exchange precision
-    market = ex.markets.get(symbol) or {}
-    step = float(market.get("precision", {}).get("amount") or market.get("limits", {}).get("amount", {}).get("min", 0)) or 1e-8
-    qty = max(step, (qty // step) * step)
-    return qty
-
-
-async def _place_market(
-    ex: ccxt.Exchange,
+async def place_order(
+    ex,
     symbol: str,
     side: str,
-    amount: float,
-    reduce_only: bool,
+    size: float,
+    order_type: str,
     product_type: str,
+    reduce_only: bool,
 ) -> Dict[str, Any]:
+    # Bitget linear perp uses amount in contracts (base quantity)
+    typ = order_type.lower()
+    s = side.lower()
     params = {
         "reduceOnly": reduce_only,
         "productType": product_type,
-        "marginCoin": MARGIN_COIN,
     }
-    order = await ex.create_order(symbol, "market", side, amount, None, params)
-    return order
+    if typ not in ("market", "limit"):
+        typ = "market"
+    if size <= 0:
+        return {"status": "skipped", "reason": "non_positive_size"}
+    order = await ex.create_order(symbol, typ, s, size, None, params)
+    return {"status": "ok", "order": order}
 
+
+# ---------- Router ----------
 
 async def smart_route(
-    ex: ccxt.Exchange,
-    unified_symbol: str,
+    ex,
+    symbol: str,
     side: str,
     order_type: str,
-    incoming_size: float,
-    intent: str | None,
-    product_type: str,
+    size: float,
+    intent: str,
+    reenter_on_opposite: bool,
+    product_type: Optional[str] = None,
 ) -> Dict[str, Any]:
-    side = side.lower()
-    intent = (intent or "").lower()
+    # defensive ex creation
+    if ex is None or isinstance(ex, str) or not hasattr(ex, "load_markets"):
+        ex = await get_exchange()
+    # ensure markets loaded
+    if not getattr(ex, "markets", None):
+        await ex.load_markets()
 
-    await ex.load_markets()
-    if unified_symbol not in ex.markets:
-        raise ValueError(f"unknown symbol: {unified_symbol}")
+    product_type = product_type or DEFAULT_PRODUCT_TYPE
+    sym = normalize_symbol(symbol)
+    s = side.lower()
+    it = (intent or "").lower()
 
-    pos_amt, pos_side = await _position_size_side(ex, unified_symbol, product_type)
+    if s not in ("buy", "sell"):
+        return {"status": "error", "reason": "invalid_side", "side": side}
+    if not ALLOW_SHORTS and s == "sell" and it in ("open", "scale"):
+        return {"status": "skipped", "reason": "shorts_disallowed"}
 
-    # Intent: close
-    if intent == "close":
-        if pos_amt <= 0:
-            return {"action": "close", "status": "skipped", "reason": "no position"}
-        close_side = "sell" if pos_side == "long" else "buy"
-        order = await _place_market(ex, unified_symbol, close_side, pos_amt, True, product_type)
-        return {"action": "close", "side": close_side, "amount": pos_amt, "orderId": order.get("id")}
+    # current net contracts
+    net = await get_net_position(ex, sym, product_type)
+    result: Dict[str, Any] = {"symbol": sym, "net_contracts": net, "intent": it}
 
-    # No position yet
-    if pos_amt == 0:
-        if intent != "open":
-            return {"action": "ignored", "reason": "no position and not open"}
-        if (not ALLOW_SHORTS) and side == "sell":
-            return {"action": "blocked", "reason": "shorts disabled"}
-        active = await _active_symbols(ex, product_type)
-        bases = {s.split("/")[0] for s in active}
-        if unified_symbol.split("/")[0] not in bases and len(bases) >= MAX_COINS:
-            return {"action": "blocked", "reason": "max coins reached", "active": list(bases)}
-        amount = await _compute_order_qty(ex, unified_symbol) if FORCE_FIXED_SIZING else float(incoming_size or 0)
-        if amount <= 0:
-            return {"action": "blocked", "reason": "zero size"}
-        order = await _place_market(ex, unified_symbol, side, amount, False, product_type)
-        return {"action": "open", "side": side, "amount": amount, "orderId": order.get("id")}
+    # ---- intent: close -> reduceOnly market in existing side only; if flat -> noop
+    if it == "close":
+        if abs(net) < 1e-9:
+            result.update({"status": "noop", "reason": "no_position"})
+            return result
+        close_side = "sell" if net > 0 else "buy"
+        close_size = abs(net) if size <= 0 else min(abs(net), size)
+        od = await place_order(
+            ex, sym, close_side, close_size, order_type, product_type, reduce_only=True
+        )
+        result.update({"action": "close", **od})
+        return result
 
-    # Position exists
-    same_dir = (pos_side == "long" and side == "buy") or (pos_side == "short" and side == "sell")
-    opposite = not same_dir
+    # ---- intent: open / scale
+    # if there is opposite position and reenter_on_opposite is False -> close-only first
+    if net != 0 and ((net > 0 and s == "sell") or (net < 0 and s == "buy")):
+        if not reenter_on_opposite:
+            # close-only to flat
+            close_side = "sell" if net > 0 else "buy"
+            od = await place_order(
+                ex, sym, close_side, abs(net), "market", product_type, reduce_only=True
+            )
+            result.update({"action": "flatten_first", **od})
+            return result
 
-    if opposite:
-        if not REENTER_ON_OPPOSITE:
-            return {"action": "blocked", "reason": "opposite while position open"}
-        await _place_market(ex, unified_symbol, "sell" if pos_side == "long" else "buy", pos_amt, True, product_type)
-        amount = await _compute_order_qty(ex, unified_symbol) if FORCE_FIXED_SIZING else float(incoming_size or 0)
-        if amount <= 0:
-            return {"action": "reenter_blocked", "reason": "zero size after close"}
-        order = await _place_market(ex, unified_symbol, side, amount, False, product_type)
-        return {"action": "reenter", "side": side, "amount": amount, "orderId": order.get("id")}
-
-    # Same direction: allow only add/open intents
-    if intent not in ("add", "open"):
-        return {"action": "ignored", "reason": "position exists but no add/open intent"}
-    amount = await _compute_order_qty(ex, unified_symbol) if FORCE_FIXED_SIZING else float(incoming_size or 0)
-    if amount <= 0:
-        return {"action": "blocked", "reason": "zero size"}
-    order = await _place_market(ex, unified_symbol, side, amount, False, product_type)
-    return {"action": "add", "side": side, "amount": amount, "orderId": order.get("id")}
+    # scale or open in same direction; reduceOnly=False
+    od = await place_order(
+        ex, sym, s, size, order_type, product_type, reduce_only=False
+    )
+    result.update({"action": "open_or_scale", **od})
+    return result
