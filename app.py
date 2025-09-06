@@ -1,119 +1,93 @@
 import os
+import json
+import logging
 from typing import Optional, Dict, Any
 
-import uvicorn
 from fastapi import FastAPI, Request, HTTPException
-from pydantic import BaseModel, Field
-import ccxt.async_support as ccxt
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, ConfigDict
 
-from trade import smart_route
+from trade import smart_route  # uses your existing trade.py
 
-APP_PORT = int(os.getenv("PORT", "10000"))
+# ---- Logging ----
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+log = logging.getLogger("router.app")
 
-BITGET_API_KEY = os.getenv("BITGET_API_KEY")
-BITGET_API_SECRET = os.getenv("BITGET_API_SECRET")
-BITGET_API_PASSWORD = os.getenv("BITGET_API_PASSWORD")
-PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "umcbl")  # umcbl (USDT-M)
-MARGIN_COIN = os.getenv("MARGIN_COIN", "USDT")
+# ---- Env ----
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mySecret123")
-REQUIRE_INTENT_FOR_OPEN = os.getenv("REQUIRE_INTENT_FOR_OPEN", "true").lower() == "true"
+REENTER_ON_OPPOSITE = os.getenv("REENTER_ON_OPPOSITE", "false").lower() == "true"
 
-app = FastAPI()
-ex: ccxt.Exchange | None = None
-
-
+# ---- Pydantic models (Pydantic v2) ----
 class Alert(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     secret: str = Field(...)
-    symbol: str = Field(..., description="e.g. LINKUSDT.P or LINK/USDT:USDT")
-    side: str = Field(..., regex="^(?i)(buy|sell)$")
+    symbol: str = Field(..., description="e.g. BTCUSDT.P or BTC/USDT:USDT")
+    side: str = Field(..., pattern="^(?i)(buy|sell)$")
     orderType: Optional[str] = Field("market", alias="orderType")
     size: Optional[float] = 0.0
-    intent: Optional[str] = Field(None, description="open | add | close")
+    intent: Optional[str] = Field(
+        None, description="open | add | close (explicit intent from strategy, optional)"
+    )
 
-    class Config:
-        allow_population_by_field_name = True
+# ---- FastAPI ----
+app = FastAPI()
 
 
-def normalize_symbol(raw: str) -> str:
-    s = raw.strip().upper()
+def normalize_symbol(s: str) -> str:
+    """Accepts forms like LINKUSDT.P, LINK/USDT:USDT, LINKUSDT:USDT and returns CCXT market id LINK/USDT:USDT."""
+    s = s.strip().upper()
     if s.endswith(".P"):
         s = s[:-2]
-    if "/" in s and ":USDT" in s:
-        return s  # already unified
+    if "/" in s and ":" in s:
+        return s
+    if ":" in s and "/" not in s:
+        base_quote, margin = s.split(":")
+        return f"{base_quote[:-4]}/{base_quote[-4:]}:{margin}"
     if s.endswith("USDT"):
         base = s[:-4]
         return f"{base}/USDT:USDT"
-    # fallback: assume base only
-    return f"{s}/USDT:USDT"
+    return s
 
 
-@app.on_event("startup")
-async def startup() -> None:
-    global ex
-    ex = ccxt.bitget({
-        "apiKey": BITGET_API_KEY,
-        "secret": BITGET_API_SECRET,
-        "password": BITGET_API_PASSWORD,
-        "enableRateLimit": True,
-        "options": {
-            "defaultType": "swap",
-            "defaultSettle": "USDT",
-            "defaultMarginMode": "cross",
-        },
-    })
-    await ex.load_markets()
-
-
-@app.on_event("shutdown")
-async def shutdown() -> None:
-    if ex:
-        await ex.close()
+@app.get("/")
+async def health() -> Dict[str, str]:
+    return {"status": "ok"}
 
 
 @app.post("/webhook")
-async def webhook(req: Request) -> Dict[str, Any]:
+async def webhook(req: Request) -> JSONResponse:
     try:
-        payload = await req.json()
+        payload: Any = await req.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="invalid json")
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
     try:
-        alert = Alert(**payload)
+        alert = Alert.model_validate(payload if isinstance(payload, dict) else json.loads(payload))
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"bad payload: {e}")
+        log.exception("Alert validation failed")
+        raise HTTPException(status_code=400, detail=f"Validation error: {e}")
 
     if alert.secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="bad secret")
-
-    if ex is None:
-        raise HTTPException(status_code=503, detail="exchange not ready")
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     symbol = normalize_symbol(alert.symbol)
-    side = alert.side.lower()
-    intent = (alert.intent or "").lower()
+    side = alert.side.lower()  # 'buy' | 'sell'
+    order_type = (alert.orderType or "market").lower()
+    size = float(alert.size or 0.0)
+    intent = (alert.intent or "").lower()  # '', 'open', 'add', 'close'
 
-    # Optional guard: without intent we only allow add/close when position exists (handled in trade.smart_route).
-    # To be extra safe, when no position and REQUIRE_INTENT_FOR_OPEN is true, block if intent != open.
-    if REQUIRE_INTENT_FOR_OPEN and intent != "open":
-        # trade.smart_route will still do final checks based on position state
-        pass
+    log.info('router.app:[ROUTER] incoming => %s %s size=%.8g intent=%s', side, symbol, size, intent or "auto")
 
     try:
-        result = await smart_route(
-            ex=ex,
-            unified_symbol=symbol,
-            side=side,
-            order_type=(alert.orderType or "market").lower(),
-            incoming_size=float(alert.size or 0.0),
-            intent=intent or None,
-            product_type=PRODUCT_TYPE,
-        )
-        return {"ok": True, **result}
-    except ccxt.BaseError as ce:
-        return {"ok": False, "error": "ccxt", "message": str(ce)}
+        # Delegate to trading logic. smart_route must:
+        # - infer intent when not provided
+        # - ignore pure close signals when no position exists
+        # - respect sizing/limits per your trade.py
+        result = await smart_route(symbol, side, order_type, size, intent, REENTER_ON_OPPOSITE)
+        return JSONResponse({"ok": True, "result": result})
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"ok": False, "error": "unhandled", "message": str(e)}
-
-
-if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=APP_PORT, workers=1)
+        log.exception("router.app:[ROUTER] unhandled")
+        raise HTTPException(status_code=500, detail=str(e))
