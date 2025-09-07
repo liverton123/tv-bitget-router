@@ -1,129 +1,163 @@
 import os
-import asyncio
+import re
+import math
+import logging
+from typing import Any, Dict, List, Optional
+
 import ccxt.async_support as ccxt
 
-# Always use Bitget mix (USDT-M perpetual) productType
-BITGET_PRODUCT_TYPE = "umcbl"  # required by Bitget mix endpoints
+logger = logging.getLogger("router.trade")
+
+BITGET_PARAMS = {"productType": "umcbl"}  # USDT-M perpetual
+
+def normalize_symbol(tv_symbol: str) -> str:
+    """
+    Accepts TradingView symbols like 'HBARUSDT' or 'HBARUSDT.P'
+    Returns ccxt market symbol 'HBAR/USDT:USDT' after market load.
+    We first strip suffix like '.P'
+    """
+    base = re.sub(r"\.[A-Za-z]+$", "", tv_symbol)
+    return base
 
 async def get_exchange() -> ccxt.bitget:
-    api_key = os.getenv("BITGET_API_KEY", "").strip()
-    api_secret = os.getenv("BITGET_API_SECRET", "").strip()
-    api_password = os.getenv("BITGET_API_PASSWORD", "").strip()
-
-    if not api_key or not api_secret or not api_password:
+    key = os.getenv("bitget_api_key")
+    secret = os.getenv("bitget_api_secret")
+    password = os.getenv("bitget_api_password")
+    if not key or not secret or not password:
         raise ValueError("Missing Bitget credentials (key/secret/password).")
 
     ex = ccxt.bitget({
-        "apiKey": api_key,
-        "secret": api_secret,
-        "password": api_password,
-        # Make sure we talk to swap/mix endpoints
+        "apiKey": key,
+        "secret": secret,
+        "password": password,
+        "enableRateLimit": True,
         "options": {
             "defaultType": "swap",
+            "defaultSettle": "USDT",
+            "productType": "umcbl",
         },
     })
-    # Load markets once before first call
     await ex.load_markets()
     return ex
 
-async def fetch_symbol_positions(ex: ccxt.bitget, symbol: str):
+def pick_market_symbol(ex: ccxt.bitget, tv_symbol: str) -> str:
     """
-    Returns the list of positions for the given symbol.
-    Bitget mix requires 'productType' in params.
+    Map 'HBARUSDT' -> ccxt market id for USDT-M swap.
     """
-    try:
-        positions = await ex.fetch_positions([symbol], {"productType": BITGET_PRODUCT_TYPE})
-        return positions or []
-    except Exception:
-        # Fallback: some ccxt versions accept None for list arg; still require productType
-        return await ex.fetch_positions(None, {"productType": BITGET_PRODUCT_TYPE})
+    sym = normalize_symbol(tv_symbol)
+    # Prefer markets with type=swap and settle=USDT
+    for m in ex.markets.values():
+        if m.get("type") == "swap" and (m.get("settle") or m.get("swap")) == "USDT":
+            if m.get("id", "").replace("-", "").replace("_", "").replace(":", "").startswith(sym.upper()):
+                return m["symbol"]
+        if m.get("type") == "swap" and m.get("symbol", "").upper().startswith(sym.upper().replace("USDT", "/USDT")):
+            return m["symbol"]
+    # Fallback: try common pattern
+    guess = sym.replace("USDT", "/USDT:USDT")
+    return guess
 
-def get_reduce_only_flag(current_qty: float, side: str) -> bool:
+async def fetch_net_position(ex: ccxt.bitget, market_symbol: str) -> float:
     """
-    If there is an opposite signed quantity, setting reduceOnly=False opens/averages.
-    If the order would reduce existing exposure, set reduceOnly=True.
+    Returns signed contracts (positive long, negative short).
     """
-    if current_qty == 0:
-        return False
-    if current_qty > 0 and side == "sell":
-        return True
-    if current_qty < 0 and side == "buy":
-        return True
-    return False
-
-def get_current_net_qty(positions) -> float:
-    """
-    Compute net position size (>0 long, <0 short) from ccxt positions payload.
-    """
-    if not positions:
-        return 0.0
+    positions = await ex.fetch_positions(None, BITGET_PARAMS)
     net = 0.0
     for p in positions:
-        # ccxt unifies sizes as floats; amount > 0 for long, < 0 for short in many exchanges.
-        # On bitget, use contracts and side to compute signed quantity.
-        contracts = float(p.get("contracts") or p.get("amount") or 0)  # contracts count
+        if p.get("symbol") != market_symbol:
+            continue
+        contracts = float(p.get("contracts") or 0)  # contracts count
         side = (p.get("side") or "").lower()
-        if contracts and side:
-            signed = contracts if side == "long" else -contracts
-            net += signed
+        if side == "long":
+            net += contracts
+        elif side == "short":
+            net -= contracts
     return net
 
-async def place_order(ex: ccxt.bitget, symbol: str, side: str, order_type: str, size: float, price=None, reduce_only=False, extra_params=None):
+def to_trade_amount(ex: ccxt.bitget, market: Dict[str, Any], raw_size: Any) -> float:
     """
-    Create order with required Bitget params.
+    Precision and min amount guard. Returns 0 if too small after rounding.
     """
-    params = {"productType": BITGET_PRODUCT_TYPE}
-    if reduce_only:
-        params["reduceOnly"] = True
-    if extra_params:
-        params.update(extra_params)
-
-    if order_type == "market":
-        return await ex.create_order(symbol, "market", side, size, None, params)
-    elif order_type == "limit":
-        if price is None:
-            raise ValueError("Limit order requires price.")
-        return await ex.create_order(symbol, "limit", side, size, price, params)
-    else:
-        raise ValueError(f"Unsupported orderType: {order_type}")
-
-async def smart_route(ex: ccxt.bitget, alert: dict):
-    """
-    Unified handler for entry/DCA/exit signals from TradingView.
-    It uses the side provided by the alert and sets reduceOnly automatically
-    when the order would close existing exposure.
-    """
-    symbol = alert["symbol"]
-    side = alert["side"].lower()
-    order_type = alert.get("orderType", "market").lower()
-    size = float(alert["size"])
-    price = alert.get("price")
-    extra_params = alert.get("params") or {}
-
-    # Ensure markets are loaded (safe if called multiple times)
-    await ex.load_markets()
-
-    # Get current net position to decide reduceOnly
-    positions = await fetch_symbol_positions(ex, symbol)
-    net_qty = get_current_net_qty(positions)
-    reduce_only = get_reduce_only_flag(net_qty, side)
-
-    # Place order
     try:
-        resp = await place_order(
-            ex=ex,
-            symbol=symbol,
-            side=side,
-            order_type=order_type,
-            size=size,
-            price=price,
-            reduce_only=reduce_only,
-            extra_params=extra_params,
-        )
-        return {"symbol": symbol, "side": side, "size": size, "reduceOnly": reduce_only, "id": resp.get("id")}
-    finally:
-        # Always close the client
+        size = float(raw_size)
+    except Exception:
+        raise ValueError(f"Invalid size: {raw_size}")
+
+    prec = float(ex.amount_to_precision(market["symbol"], size))
+    limits = (market.get("limits") or {}).get("amount") or {}
+    min_amt = limits.get("min")
+    if min_amt is not None:
         try:
-            await ex.close()
+            min_amt = float(min_amt)
         except Exception:
-            pass
+            min_amt = None
+    if min_amt and prec < min_amt:
+        logger.info(f"SKIP_TOO_SMALL symbol={market['symbol']} raw={size} prec={prec} min={min_amt}")
+        return 0.0
+    return prec
+
+async def place(ex: ccxt.bitget, symbol: str, side: str, amount: float, reduce_only: bool) -> Dict[str, Any]:
+    if amount <= 0:
+        return {"status": "skipped", "reason": "too_small"}
+    params = {"reduceOnly": reduce_only, **BITGET_PARAMS}
+    logger.info(f"ORDER symbol={symbol} side={side} amt={amount} reduceOnly={reduce_only}")
+    order = await ex.create_order(symbol, "market", side, amount, None, params)
+    return {"status": "filled", "id": order.get("id"), "amount": amount, "reduceOnly": reduce_only}
+
+async def smart_route(ex: ccxt.bitget, data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Route: entry/scale/exit/flip based on current net position and incoming side/size.
+    - side 'buy' means long direction, 'sell' means short direction.
+    - If opposite direction and amount > existing position, we close then open the remainder.
+    """
+    tv_symbol = str(data["symbol"]).upper()
+    side = str(data["side"]).lower().strip()
+    order_type = str(data["orderType"]).lower().strip()
+    raw_size = data["size"]
+
+    if order_type != "market":
+        raise ValueError("Only market orders are supported.")
+
+    mkt_symbol = pick_market_symbol(ex, tv_symbol)
+    market = ex.market(mkt_symbol) if mkt_symbol in ex.markets else {"symbol": mkt_symbol}
+    amount = to_trade_amount(ex, market, raw_size)
+    if amount == 0:
+        return {"status": "skipped", "reason": "too_small"}
+
+    net = await fetch_net_position(ex, market["symbol"])
+    logger.info(f"STATE symbol={market['symbol']} net={net} incoming_side={side} amt={amount}")
+
+    # Direction helpers
+    def same_dir(net_pos: float, s: str) -> bool:
+        return (net_pos > 0 and s == "buy") or (net_pos < 0 and s == "sell")
+
+    def opposite_dir(net_pos: float, s: str) -> bool:
+        return (net_pos > 0 and s == "sell") or (net_pos < 0 and s == "buy")
+
+    results: List[Dict[str, Any]] = []
+
+    if net == 0:
+        # Fresh entry
+        res = await place(ex, market["symbol"], side, amount, reduce_only=False)
+        results.append({"decision": "OPEN_LONG" if side == "buy" else "OPEN_SHORT", **res})
+        return {"ok": True, "results": results}
+
+    if same_dir(net, side):
+        # Scale in
+        res = await place(ex, market["symbol"], side, amount, reduce_only=False)
+        results.append({"decision": "SCALE_IN_LONG" if side == "buy" else "SCALE_IN_SHORT", **res})
+        return {"ok": True, "results": results}
+
+    # Opposite direction -> reduce or flip
+    close_amt = min(abs(net), amount)
+    if close_amt > 0:
+        close_side = "sell" if net > 0 else "buy"  # to offset existing
+        res_close = await place(ex, market["symbol"], close_side, close_amt, reduce_only=True)
+        results.append({"decision": "REDUCE_EXISTING", **res_close})
+
+    remainder = max(0.0, amount - close_amt)
+    if remainder > 0:
+        # Flip remainder to new side
+        res_open = await place(ex, market["symbol"], side, remainder, reduce_only=False)
+        results.append({"decision": "FLIP_OPEN", **res_open})
+
+    return {"ok": True, "results": results}
