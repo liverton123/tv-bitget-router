@@ -1,42 +1,53 @@
 import os
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
-from typing import Literal, Optional, Dict, Any
+import json
+import logging
+from typing import Any, Dict
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
 from trade import get_exchange, smart_route
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("router")
 
 app = FastAPI()
 
-# Webhook secret from env (optional but recommended)
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-
-# Pydantic model for TradingView alert payload
-class Alert(BaseModel):
-    secret: Optional[str] = None
-    symbol: str = Field(..., description="e.g. HBARUSDT.P")
-    side: Literal["buy", "sell"]
-    orderType: Literal["market", "limit"] = "market"
-    size: float = Field(..., gt=0)
-    price: Optional[float] = Field(None, gt=0)  # used only when orderType == "limit"
-    # passthrough params if needed
-    params: Optional[Dict[str, Any]] = None
+@app.get("/")
+async def root():
+    return {"status": "ok"}
 
 @app.post("/webhook")
-async def webhook(alert: Alert, request: Request):
-    # Secret check (if WEBHOOK_SECRET is set)
-    if WEBHOOK_SECRET:
-        if not alert.secret or alert.secret != WEBHOOK_SECRET:
-            raise HTTPException(status_code=401, detail="Invalid secret")
-
+async def webhook(request: Request):
     try:
-        ex = await get_exchange()
-        result = await smart_route(ex, alert.dict())
-        return {"ok": True, "result": result}
-    except HTTPException:
-        raise
-    except Exception as e:
-        # make it visible in logs and as 500 to TradingView
-        raise HTTPException(status_code=500, detail=str(e))
+        data: Dict[str, Any] = await request.json()
+    except Exception:
+        body = await request.body()
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except Exception:
+            logger.exception("Invalid JSON payload")
+            return JSONResponse({"status": "error", "reason": "invalid_json"}, status_code=400)
 
-@app.get("/health")
-async def health():
-    return {"ok": True}
+    required = ["secret", "symbol", "side", "orderType", "size"]
+    missing = [k for k in required if k not in data]
+    if missing:
+        return JSONResponse({"status": "error", "reason": f"missing:{','.join(missing)}"}, 400)
+
+    # Secret check (optional): set ROUTER_SECRET to enforce
+    expected = os.getenv("ROUTER_SECRET")
+    if expected and data.get("secret") != expected:
+        return JSONResponse({"status": "error", "reason": "unauthorized"}, 401)
+
+    ex = await get_exchange()
+    try:
+        result = await smart_route(ex, data)
+        return JSONResponse(result, 200)
+    except Exception as e:
+        logger.exception("Unhandled error in webhook")
+        return JSONResponse({"status": "error", "reason": str(e)}, 500)
+    finally:
+        try:
+            await ex.close()
+        except Exception:
+            logger.info("Closed client session/connector")
