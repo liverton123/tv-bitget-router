@@ -1,181 +1,123 @@
 import os
 import re
-from typing import Optional, Literal, Dict, Any, List
 import ccxt.async_support as ccxt
 
-# ---------- normalization helpers ----------
-def normalize_product_type(v: Optional[str]) -> Optional[str]:
-    if not v:
-        return None
-    t = v.strip().lower()
-    # bitget productType aliases
-    alias = {
-        "umcbl": "umcbl",          # USDT-M linear perpetual
-        "usdt": "umcbl",
-        "usdt-perp": "umcbl",
-        "usdt-futures": "umcbl",
-        "linear": "umcbl",
-        "perp": "umcbl",
-        "swap": "umcbl",
-        "dmcbl": "dmcbl",          # coin-M
-        "coin": "dmcbl",
-        "coin-perp": "dmcbl",
-    }
-    return alias.get(t, t)
-
-_SYMBOL_P_PATTERN = re.compile(r"^([A-Z0-9]+)USDT\.P$")
+# ---------- Helpers ----------
 def normalize_symbol(symbol: str) -> str:
     s = symbol.strip().upper()
-    # Convert BINANCE/TV style perpetual ticker HBARUSDT.P -> CCXT unified HBAR/USDT:USDT
-    m = _SYMBOL_P_PATTERN.match(s)
-    if m:
-        base = m.group(1)
-        return f"{base}/USDT:USDT"
-    # Already unified? return as-is
-    return s
+    # 허용 포맷 예: BTCUSDT.P, BTCUSDT_UMCBL 등 -> BTC/USDT:USDT (ccxt bitget 포맷)
+    if s.endswith(".P"):
+        s = s[:-2]  # HBARUSDT.P -> HBARUSDT
+    base_quote = s.replace("_UMCBL", "")
+    m = re.match(r"^([A-Z0-9]+)USDT$", base_quote)
+    if not m:
+        return symbol  # 원본 유지(추후 ccxt에서 실패 시 에러 반환)
+    base = m.group(1)
+    return f"{base}/USDT:USDT"
 
-# ---------- exchange factory ----------
+def normalize_product_type(v: str) -> str:
+    x = (v or "").strip().lower()
+    # 비트겟 USDT 무기한: umcbl, 코인 마진: dmcbl 등
+    mapping = {
+        "umcbl": "umcbl",
+        "usdt": "umcbl",
+        "usdt_perp": "umcbl",
+        "perp": "umcbl",
+        "um": "umcbl",
+        "dmcbl": "dmcbl",
+        "coin": "dmcbl",
+    }
+    return mapping.get(x, x or "umcbl")
+
 async def get_exchange():
-    key = (
-        os.getenv("BITGET_API_KEY")
-        or os.getenv("BITGET_KEY")
-        or os.getenv("API_KEY")
-    )
-    secret = (
-        os.getenv("BITGET_API_SECRET")
-        or os.getenv("BITGET_SECRET")
-        or os.getenv("API_SECRET")
-    )
-    password = (
-        os.getenv("BITGET_PASSPHRASE")
-        or os.getenv("BITGET_API_PASSWORD")
-        or os.getenv("BITGET_PASSWORD")
-        or os.getenv("API_PASSWORD")
-        or os.getenv("PASSPHRASE")
-        or os.getenv("PASSWORD")
-    )
+    key = os.getenv("BITGET_KEY", "").strip()
+    secret = os.getenv("BITGET_SECRET", "").strip()
+    password = os.getenv("BITGET_PASSWORD", "").strip()
+
     if not key or not secret or not password:
         raise ValueError("Missing Bitget credentials (key/secret/password).")
 
-    ex = ccxt.bitget(
-        {
-            "apiKey": key,
-            "secret": secret,
-            "password": password,
-            "enableRateLimit": True,
-            "options": {
-                "defaultType": "swap",     # perpetual
-                "defaultSubType": "linear" # USDT-margined by default
-            },
-        }
-    )
+    ex = ccxt.bitget({
+        "apiKey": key,
+        "secret": secret,
+        "password": password,
+        "options": {
+            "defaultType": "swap",  # 선물/무기한
+            "defaultSubType": "linear",  # USDT margined
+        },
+        "enableRateLimit": True,
+    })
     await ex.load_markets()
     return ex
 
-# ---------- positions ----------
-async def fetch_symbol_positions(ex, symbol: str, product_type: str) -> List[Dict[str, Any]]:
-    params = {"productType": product_type}
-    try:
-        pos = await ex.fetch_positions([symbol], params)
-    except Exception:
-        pos = await ex.fetch_positions(None, params)
-    # CCXT returns unified 'symbol' like HBAR/USDT:USDT
-    return [p for p in pos if p.get("symbol") == symbol]
+async def fetch_symbol_positions(ex, symbol: str, product_type: str):
+    # bitget은 심볼 미지정으로 전체 조회하는 편이 더 견고함
+    params = {"productType": normalize_product_type(product_type)}
+    return await ex.fetch_positions(None, params)
 
-async def get_net_position(ex, symbol: str, product_type: str) -> float:
-    positions = await fetch_symbol_positions(ex, symbol, product_type)
-    net = 0.0
+def get_net_position(positions, symbol: str, product_type: str):
+    unified = normalize_symbol(symbol)
+    pt = normalize_product_type(product_type)
+    qty = 0.0
+    side = None
     for p in positions:
-        side = (p.get("side") or p.get("positionSide") or "").lower()
-        contracts = p.get("contracts") or p.get("positionAmt") or p.get("size") or 0
-        try:
-            qty = float(contracts)
-        except Exception:
-            qty = 0.0
-        if side.startswith("long"):
-            net += qty
-        elif side.startswith("short"):
-            net -= qty
-    return net
+        if p.get("symbol") == unified and p.get("info", {}).get("productType", "").lower() == pt:
+            amt = float(p.get("contracts", 0) or 0)
+            if amt > 0:
+                side = p.get("side") or ("long" if amt > 0 else "short")
+            qty += amt if (p.get("side") in {"long", "buy", "open_long"}) else -amt
+    return qty, side
 
-# ---------- orders ----------
-async def place(
-    ex,
-    symbol: str,
-    side: Literal["buy", "sell"],
-    order_type: Literal["market", "limit"],
-    size: float,
-    product_type: str,
-    reduce_only: bool = False,
-    price: Optional[float] = None,
-) -> Dict[str, Any]:
-    if not product_type:
-        raise ValueError("product_type is required")
-    params = {"productType": product_type, "reduceOnly": reduce_only}
-    amount = float(size)
-    if order_type == "limit":
-        if price is None:
-            raise ValueError("price required for limit orders")
-        order = await ex.create_order(symbol, "limit", side, amount, price, params)
+async def place_order(ex, symbol: str, side: str, order_type: str, size: float, price=None, product_type="umcbl"):
+    unified = normalize_symbol(symbol)
+    pt = normalize_product_type(product_type)
+    params = {"productType": pt}
+    if order_type == "market":
+        return await ex.create_order(unified, "market", side, size, None, params)
+    elif order_type == "limit":
+        if not price:
+            raise ValueError("price is required for limit orders")
+        return await ex.create_order(unified, "limit", side, size, price, params)
     else:
-        order = await ex.create_order(symbol, "market", side, amount, None, params)
-    return {
-        "id": order.get("id"),
-        "reduceOnly": reduce_only,
-        "amount": amount,
-        "type": order_type,
-        "side": side,
-        "symbol": symbol,
-    }
+        raise ValueError(f"unsupported orderType: {order_type}")
 
-# ---------- router ----------
 async def smart_route(
     ex,
     symbol: str,
-    side: Literal["buy", "sell"],
-    order_type: Literal["market", "limit"],
+    side: str,
+    order_type: str,
     size: float,
-    intent: Optional[Literal["entry", "scale", "close", "auto"]],
-    reenter_on_opposite: bool,
-    product_type: str,
-    price: Optional[float] = None,
-) -> Dict[str, Any]:
-    if intent is None:
-        intent = "auto"
-    product_type = normalize_product_type(product_type)
-    if not product_type:
-        raise ValueError("invalid product_type")
+    intent: str = "auto",
+    reenter_on_opposite: bool = False,
+    product_type: str = "umcbl",
+    price=None,
+):
+    # 1) 포지션 조회
+    pos_list = await fetch_symbol_positions(ex, symbol, product_type)
+    net_qty, pos_side = get_net_position(pos_list, symbol, product_type)
 
-    net = await get_net_position(ex, symbol, product_type)
-    ops: List[Dict[str, Any]] = []
+    # 2) intent == auto: 사이드/포지션 기준 자동 판단
+    action = intent
+    if intent == "auto":
+        if net_qty == 0:
+            action = "entry"  # 신규 진입
+        elif pos_side == "long":
+            if side == "sell":
+                action = "close" if not reenter_on_opposite else "entry"
+            else:
+                action = "scale"
+        elif pos_side == "short":
+            if side == "buy":
+                action = "close" if not reenter_on_opposite else "entry"
+            else:
+                action = "scale"
 
-    if intent == "close":
-        ops.append(await place(ex, symbol, side, order_type, size, product_type, True, price))
-        return {"ops": ops, "net_before": net}
-
-    if intent in ("entry", "scale"):
-        ops.append(await place(ex, symbol, side, order_type, size, product_type, False, price))
-        return {"ops": ops, "net_before": net}
-
-    # auto
-    if net == 0:
-        ops.append(await place(ex, symbol, side, order_type, size, product_type, False, price))
-        return {"ops": ops, "net_before": net}
-
-    side_is_buy = side == "buy"
-
-    # same-direction add
-    if (side_is_buy and net > 0) or ((not side_is_buy) and net < 0):
-        ops.append(await place(ex, symbol, side, order_type, size, product_type, False, price))
-        return {"ops": ops, "net_before": net}
-
-    # opposite-direction: close first, then optionally re-enter
-    qty_to_close = min(abs(net), float(size))
-    if qty_to_close > 0:
-        ops.append(await place(ex, symbol, side, order_type, qty_to_close, product_type, True, price))
-
-    remaining = float(size) - qty_to_close
-    if remaining > 0 and reenter_on_opposite:
-        ops.append(await place(ex, symbol, side, order_type, remaining, product_type, False, price))
-
-    return {"ops": ops, "net_before": net}
+    # 3) 실행
+    if action == "close":
+        # 반대 주문으로 size 만큼 청산
+        close_side = "buy" if side == "sell" else "sell"
+        return await place_order(ex, symbol, close_side, order_type, size, price, product_type)
+    elif action in {"entry", "scale"}:
+        return await place_order(ex, symbol, side, order_type, size, price, product_type)
+    else:
+        raise ValueError(f"unsupported intent: {intent}")
