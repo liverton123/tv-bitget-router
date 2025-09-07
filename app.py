@@ -1,14 +1,11 @@
 import os
 from typing import Optional, Literal
-
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
-
 from trade import smart_route, get_exchange
 
 app = FastAPI()
 
-# --- helpers ---
 def str_to_bool(value: Optional[str], default: bool = False) -> bool:
     if value is None:
         return default
@@ -17,14 +14,11 @@ def str_to_bool(value: Optional[str], default: bool = False) -> bool:
         return True
     if v in {"0", "false", "no", "n", "off"}:
         return False
-    # fallback: non-empty strings like "t"/"f" won't crash; treat truthy only if exactly truthy tokens
     return default
 
-# --- config ---
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mySecret123!")
 REENTER_ON_OPPOSITE = str_to_bool(os.getenv("REENTER_ON_OPPOSITE"), False)
 DEFAULT_PRODUCT_TYPE = os.getenv("PRODUCT_TYPE", "USDT-FUTURES")
-
 
 class Alert(BaseModel):
     secret: str = Field(..., min_length=1)
@@ -35,7 +29,6 @@ class Alert(BaseModel):
     intent: Optional[Literal["entry", "scale", "close", "auto"]] = "auto"
     product_type: Optional[str] = None
     price: Optional[float] = Field(default=None, gt=0)
-
 
 @app.post("/webhook")
 async def webhook(alert: Alert, request: Request):
@@ -63,7 +56,6 @@ async def webhook(alert: Alert, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         await ex.close()
-
 
 @app.get("/health")
 async def health():
