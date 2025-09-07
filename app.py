@@ -1,5 +1,4 @@
 import os
-import json
 from fastapi import FastAPI, Request
 from trade import smart_route
 
@@ -18,10 +17,9 @@ async def webhook(request: Request):
     side = data.get("side")
     order_type = data.get("orderType", "market")
     size = float(data.get("size", 0))
-
     intent = data.get("intent", "auto")
 
-    product_type = "UMCBL"  # default for USDT perpetual
+    product_type = "UMCBL"  # Bitget USDT-M perpetual
 
     await smart_route(symbol, side, order_type, size, intent, product_type)
     return {"status": "success"}
