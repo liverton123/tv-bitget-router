@@ -1,210 +1,148 @@
 import os
-from typing import Any, Dict, List, Optional, Tuple, Literal
-
+from typing import Optional, Literal, Dict, Any, List
 import ccxt.async_support as ccxt
 
-
-BITGET_API_KEY = os.getenv("BITGET_API_KEY", "")
-BITGET_SECRET = os.getenv("BITGET_SECRET", "")
-# Bitget needs passphrase/password (sometimes called "password")
-BITGET_PASSWORD = os.getenv("BITGET_PASSWORD", "")
-
-# default product type for Bitget futures
-DEFAULT_PRODUCT_TYPE = os.getenv("PRODUCT_TYPE", "USDT-FUTURES")
-
-
-async def get_exchange() -> ccxt.bitget:
-    """
-    Returns an authenticated ccxt.async_support.bitget instance.
-    """
-    if not (BITGET_API_KEY and BITGET_SECRET and BITGET_PASSWORD):
+# --- exchange bootstrap -------------------------------------------------------
+async def get_exchange():
+    # Accept multiple env var names to avoid deployment mismatches
+    key = (
+        os.getenv("BITGET_API_KEY")
+        or os.getenv("BITGET_KEY")
+        or os.getenv("API_KEY")
+    )
+    secret = (
+        os.getenv("BITGET_API_SECRET")
+        or os.getenv("BITGET_SECRET")
+        or os.getenv("API_SECRET")
+    )
+    # Bitget uses "password" for passphrase in CCXT
+    password = (
+        os.getenv("BITGET_PASSPHRASE")
+        or os.getenv("BITGET_API_PASSWORD")
+        or os.getenv("BITGET_PASSWORD")
+        or os.getenv("API_PASSWORD")
+        or os.getenv("PASSPHRASE")
+        or os.getenv("PASSWORD")
+    )
+    if not key or not secret or not password:
         raise ValueError("Missing Bitget credentials (key/secret/password).")
 
     ex = ccxt.bitget(
         {
-            "apiKey": BITGET_API_KEY,
-            "secret": BITGET_SECRET,
-            "password": BITGET_PASSWORD,
-            "options": {
-                # ensure we use unified futures endpoints
-                "defaultType": "swap",  # perp/futures
-            },
+            "apiKey": key,
+            "secret": secret,
+            "password": password,
             "enableRateLimit": True,
+            "options": {
+                # USDT-M perpetual
+                "defaultType": "swap",
+                "defaultSubType": "linear",
+            },
         }
     )
     await ex.load_markets()
     return ex
 
-
-async def fetch_symbol_positions(
-    ex: ccxt.bitget,
-    symbol: str,
-    product_type: str,
-) -> List[Dict[str, Any]]:
-    """
-    Fetch all positions (filtered to symbol when supported).
-    Bitget via ccxt requires 'productType' param.
-    """
+# --- position helpers ---------------------------------------------------------
+async def fetch_symbol_positions(ex, symbol: str, product_type: str) -> List[Dict[str, Any]]:
     params = {"productType": product_type}
-    # Some ccxt versions ignore the symbols filter for bitget; still pass it if available
     try:
-        positions = await ex.fetch_positions([symbol], params)
+        pos = await ex.fetch_positions([symbol], params)
+        return [p for p in pos if p.get("symbol") == symbol]
     except Exception:
-        positions = await ex.fetch_positions(None, params)
-    return positions or []
+        pos = await ex.fetch_positions(None, params)
+        return [p for p in pos if p.get("symbol") == symbol]
 
-
-def _extract_net_position_for_symbol(
-    positions: List[Dict[str, Any]],
-    symbol: str,
-) -> Tuple[float, Optional[str]]:
-    """
-    Compute net position size for the given symbol.
-    Returns (net_size, side) where side in {"long","short",None} and net_size >= 0.
-    """
-    net = 0.0
-    long_amt = 0.0
-    short_amt = 0.0
-    for p in positions:
-        if p.get("symbol") != symbol:
-            continue
-        amt = float(p.get("contracts", p.get("amount", 0)) or 0)
-        side = p.get("side")
-        if side == "long":
-            long_amt += amt
-        elif side == "short":
-            short_amt += amt
-        else:
-            # some exchanges report positive/negative separately
-            amt_signed = float(p.get("contracts", p.get("amount", 0)) or 0)
-            if amt_signed >= 0:
-                long_amt += amt_signed
-            else:
-                short_amt += abs(amt_signed)
-    net = long_amt - short_amt
-    if net > 0:
-        return net, "long"
-    if net < 0:
-        return abs(net), "short"
-    return 0.0, None
-
-
-async def get_net_position(
-    ex: ccxt.bitget, symbol: str, product_type: str
-) -> Tuple[float, Optional[str]]:
+async def get_net_position(ex, symbol: str, product_type: str) -> float:
     positions = await fetch_symbol_positions(ex, symbol, product_type)
-    return _extract_net_position_for_symbol(positions, symbol)
+    net = 0.0
+    for p in positions:
+        side = (p.get("side") or p.get("positionSide") or "").lower()
+        contracts = p.get("contracts") or p.get("positionAmt") or p.get("size") or 0
+        try:
+            qty = float(contracts)
+        except Exception:
+            qty = 0.0
+        if side.startswith("long"):
+            net += qty
+        elif side.startswith("short"):
+            net -= qty
+    return net
 
-
-async def place_order(
-    ex: ccxt.bitget,
+# --- order helper -------------------------------------------------------------
+async def place(
+    ex,
     symbol: str,
     side: Literal["buy", "sell"],
     order_type: Literal["market", "limit"],
     size: float,
     product_type: str,
-    reduce_only: bool,
+    reduce_only: bool = False,
     price: Optional[float] = None,
 ) -> Dict[str, Any]:
-    params: Dict[str, Any] = {
-        "productType": product_type,
+    params = {"productType": product_type, "reduceOnly": reduce_only}
+    amount = float(size)
+    if order_type == "limit":
+        if price is None:
+            raise ValueError("price required for limit orders")
+        order = await ex.create_order(symbol, "limit", side, amount, price, params)
+    else:
+        order = await ex.create_order(symbol, "market", side, amount, None, params)
+    return {
+        "id": order.get("id"),
         "reduceOnly": reduce_only,
+        "amount": amount,
+        "type": order_type,
+        "side": side,
     }
 
-    amount = size
-    price_arg = None if order_type == "market" else float(price) if price else None
-
-    return await ex.create_order(
-        symbol=symbol,
-        type=order_type,
-        side=side,
-        amount=amount,
-        price=price_arg,
-        params=params,
-    )
-
-
+# --- router -------------------------------------------------------------------
 async def smart_route(
-    ex: ccxt.bitget,
+    ex,
     symbol: str,
     side: Literal["buy", "sell"],
     order_type: Literal["market", "limit"],
     size: float,
-    intent: Literal["entry", "scale", "close", "auto"],
+    intent: Optional[Literal["entry", "scale", "close", "auto"]],
     reenter_on_opposite: bool,
-    product_type: Optional[str] = None,
+    product_type: str,
     price: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """
-    Intent rules:
-      - entry : open new in the direction of `side` (reduceOnly = False)
-      - scale : add to existing in the direction of `side` (reduceOnly = False)
-      - close : close existing; `side` should be the *opposite* of the open direction (reduceOnly = True)
-      - auto  : infer from current net position and incoming `side`
-                * no position -> entry
-                * long position & side=='buy'  -> scale
-                * long position & side=='sell' -> close (no auto-reverse unless reenter_on_opposite=1)
-                * short position & side=='sell'-> scale
-                * short position & side=='buy' -> close
-                * if reenter_on_opposite==1 and incoming signal is opposite while flat after close,
-                  we immediately place an entry in that direction.
-    """
-    pt = product_type or DEFAULT_PRODUCT_TYPE
+    if intent is None:
+        intent = "auto"
 
-    # Always ensure markets are loaded (safe if already loaded)
-    await ex.load_markets()
+    net = await get_net_position(ex, symbol, product_type)
+    ops: List[Dict[str, Any]] = []
 
-    net_size, net_side = await get_net_position(ex, symbol, pt)
+    # explicit close
+    if intent == "close":
+        ops.append(await place(ex, symbol, side, order_type, size, product_type, True, price))
+        return {"ops": ops, "net_before": net}
 
-    if intent == "auto":
-        if net_size == 0:
-            intent_to_use = "entry"
-        elif net_side == "long":
-            intent_to_use = "scale" if side == "buy" else "close"
-        else:  # net_side == "short"
-            intent_to_use = "scale" if side == "sell" else "close"
-    else:
-        intent_to_use = intent
+    # explicit entry/scale
+    if intent in ("entry", "scale"):
+        ops.append(await place(ex, symbol, side, order_type, size, product_type, False, price))
+        return {"ops": ops, "net_before": net}
 
-    # Determine reduceOnly flag
-    reduce_only = intent_to_use == "close"
+    # auto
+    if net == 0:
+        ops.append(await place(ex, symbol, side, order_type, size, product_type, False, price))
+        return {"ops": ops, "net_before": net}
 
-    # If intent is close but there is no position, ignore (no-op)
-    if intent_to_use == "close" and net_size == 0:
-        return {"skipped": True, "reason": "no position to close"}
+    side_is_buy = side == "buy"
 
-    # Place the primary order
-    primary = await place_order(
-        ex=ex,
-        symbol=symbol,
-        side=side,
-        order_type=order_type,
-        size=size,
-        product_type=pt,
-        reduce_only=reduce_only,
-        price=price,
-    )
+    # same-direction add
+    if (side_is_buy and net > 0) or ((not side_is_buy) and net < 0):
+        ops.append(await place(ex, symbol, side, order_type, size, product_type, False, price))
+        return {"ops": ops, "net_before": net}
 
-    # Optional immediate re-entry on opposite after closing (strategy preference)
-    maybe_reenter: Optional[Dict[str, Any]] = None
-    if intent_to_use == "close" and reenter_on_opposite:
-        opp_side = "buy" if side == "sell" else "sell"
-        maybe_reenter = await place_order(
-            ex=ex,
-            symbol=symbol,
-            side=opp_side,
-            order_type=order_type,
-            size=size,
-            product_type=pt,
-            reduce_only=False,
-            price=price,
-        )
+    # opposite-direction: close first, then optionally re-enter
+    qty_to_close = min(abs(net), float(size))
+    if qty_to_close > 0:
+        ops.append(await place(ex, symbol, side, order_type, qty_to_close, product_type, True, price))
 
-    out: Dict[str, Any] = {
-        "intent": intent_to_use,
-        "reduceOnly": reduce_only,
-        "submitted": primary,
-    }
-    if maybe_reenter:
-        out["reentered"] = maybe_reenter
-    return out
+    remaining = float(size) - qty_to_close
+    if remaining > 0 and reenter_on_opposite:
+        ops.append(await place(ex, symbol, side, order_type, remaining, product_type, False, price))
+
+    return {"ops": ops, "net_before": net}
