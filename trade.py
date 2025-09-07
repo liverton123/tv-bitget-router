@@ -1,123 +1,129 @@
 import os
-import re
+import asyncio
 import ccxt.async_support as ccxt
 
-# ---------- Helpers ----------
-def normalize_symbol(symbol: str) -> str:
-    s = symbol.strip().upper()
-    # 허용 포맷 예: BTCUSDT.P, BTCUSDT_UMCBL 등 -> BTC/USDT:USDT (ccxt bitget 포맷)
-    if s.endswith(".P"):
-        s = s[:-2]  # HBARUSDT.P -> HBARUSDT
-    base_quote = s.replace("_UMCBL", "")
-    m = re.match(r"^([A-Z0-9]+)USDT$", base_quote)
-    if not m:
-        return symbol  # 원본 유지(추후 ccxt에서 실패 시 에러 반환)
-    base = m.group(1)
-    return f"{base}/USDT:USDT"
+# Always use Bitget mix (USDT-M perpetual) productType
+BITGET_PRODUCT_TYPE = "umcbl"  # required by Bitget mix endpoints
 
-def normalize_product_type(v: str) -> str:
-    x = (v or "").strip().lower()
-    # 비트겟 USDT 무기한: umcbl, 코인 마진: dmcbl 등
-    mapping = {
-        "umcbl": "umcbl",
-        "usdt": "umcbl",
-        "usdt_perp": "umcbl",
-        "perp": "umcbl",
-        "um": "umcbl",
-        "dmcbl": "dmcbl",
-        "coin": "dmcbl",
-    }
-    return mapping.get(x, x or "umcbl")
+async def get_exchange() -> ccxt.bitget:
+    api_key = os.getenv("BITGET_API_KEY", "").strip()
+    api_secret = os.getenv("BITGET_API_SECRET", "").strip()
+    api_password = os.getenv("BITGET_API_PASSWORD", "").strip()
 
-async def get_exchange():
-    key = os.getenv("BITGET_KEY", "").strip()
-    secret = os.getenv("BITGET_SECRET", "").strip()
-    password = os.getenv("BITGET_PASSWORD", "").strip()
-
-    if not key or not secret or not password:
+    if not api_key or not api_secret or not api_password:
         raise ValueError("Missing Bitget credentials (key/secret/password).")
 
     ex = ccxt.bitget({
-        "apiKey": key,
-        "secret": secret,
-        "password": password,
+        "apiKey": api_key,
+        "secret": api_secret,
+        "password": api_password,
+        # Make sure we talk to swap/mix endpoints
         "options": {
-            "defaultType": "swap",  # 선물/무기한
-            "defaultSubType": "linear",  # USDT margined
+            "defaultType": "swap",
         },
-        "enableRateLimit": True,
     })
+    # Load markets once before first call
     await ex.load_markets()
     return ex
 
-async def fetch_symbol_positions(ex, symbol: str, product_type: str):
-    # bitget은 심볼 미지정으로 전체 조회하는 편이 더 견고함
-    params = {"productType": normalize_product_type(product_type)}
-    return await ex.fetch_positions(None, params)
+async def fetch_symbol_positions(ex: ccxt.bitget, symbol: str):
+    """
+    Returns the list of positions for the given symbol.
+    Bitget mix requires 'productType' in params.
+    """
+    try:
+        positions = await ex.fetch_positions([symbol], {"productType": BITGET_PRODUCT_TYPE})
+        return positions or []
+    except Exception:
+        # Fallback: some ccxt versions accept None for list arg; still require productType
+        return await ex.fetch_positions(None, {"productType": BITGET_PRODUCT_TYPE})
 
-def get_net_position(positions, symbol: str, product_type: str):
-    unified = normalize_symbol(symbol)
-    pt = normalize_product_type(product_type)
-    qty = 0.0
-    side = None
+def get_reduce_only_flag(current_qty: float, side: str) -> bool:
+    """
+    If there is an opposite signed quantity, setting reduceOnly=False opens/averages.
+    If the order would reduce existing exposure, set reduceOnly=True.
+    """
+    if current_qty == 0:
+        return False
+    if current_qty > 0 and side == "sell":
+        return True
+    if current_qty < 0 and side == "buy":
+        return True
+    return False
+
+def get_current_net_qty(positions) -> float:
+    """
+    Compute net position size (>0 long, <0 short) from ccxt positions payload.
+    """
+    if not positions:
+        return 0.0
+    net = 0.0
     for p in positions:
-        if p.get("symbol") == unified and p.get("info", {}).get("productType", "").lower() == pt:
-            amt = float(p.get("contracts", 0) or 0)
-            if amt > 0:
-                side = p.get("side") or ("long" if amt > 0 else "short")
-            qty += amt if (p.get("side") in {"long", "buy", "open_long"}) else -amt
-    return qty, side
+        # ccxt unifies sizes as floats; amount > 0 for long, < 0 for short in many exchanges.
+        # On bitget, use contracts and side to compute signed quantity.
+        contracts = float(p.get("contracts") or p.get("amount") or 0)  # contracts count
+        side = (p.get("side") or "").lower()
+        if contracts and side:
+            signed = contracts if side == "long" else -contracts
+            net += signed
+    return net
 
-async def place_order(ex, symbol: str, side: str, order_type: str, size: float, price=None, product_type="umcbl"):
-    unified = normalize_symbol(symbol)
-    pt = normalize_product_type(product_type)
-    params = {"productType": pt}
+async def place_order(ex: ccxt.bitget, symbol: str, side: str, order_type: str, size: float, price=None, reduce_only=False, extra_params=None):
+    """
+    Create order with required Bitget params.
+    """
+    params = {"productType": BITGET_PRODUCT_TYPE}
+    if reduce_only:
+        params["reduceOnly"] = True
+    if extra_params:
+        params.update(extra_params)
+
     if order_type == "market":
-        return await ex.create_order(unified, "market", side, size, None, params)
+        return await ex.create_order(symbol, "market", side, size, None, params)
     elif order_type == "limit":
-        if not price:
-            raise ValueError("price is required for limit orders")
-        return await ex.create_order(unified, "limit", side, size, price, params)
+        if price is None:
+            raise ValueError("Limit order requires price.")
+        return await ex.create_order(symbol, "limit", side, size, price, params)
     else:
-        raise ValueError(f"unsupported orderType: {order_type}")
+        raise ValueError(f"Unsupported orderType: {order_type}")
 
-async def smart_route(
-    ex,
-    symbol: str,
-    side: str,
-    order_type: str,
-    size: float,
-    intent: str = "auto",
-    reenter_on_opposite: bool = False,
-    product_type: str = "umcbl",
-    price=None,
-):
-    # 1) 포지션 조회
-    pos_list = await fetch_symbol_positions(ex, symbol, product_type)
-    net_qty, pos_side = get_net_position(pos_list, symbol, product_type)
+async def smart_route(ex: ccxt.bitget, alert: dict):
+    """
+    Unified handler for entry/DCA/exit signals from TradingView.
+    It uses the side provided by the alert and sets reduceOnly automatically
+    when the order would close existing exposure.
+    """
+    symbol = alert["symbol"]
+    side = alert["side"].lower()
+    order_type = alert.get("orderType", "market").lower()
+    size = float(alert["size"])
+    price = alert.get("price")
+    extra_params = alert.get("params") or {}
 
-    # 2) intent == auto: 사이드/포지션 기준 자동 판단
-    action = intent
-    if intent == "auto":
-        if net_qty == 0:
-            action = "entry"  # 신규 진입
-        elif pos_side == "long":
-            if side == "sell":
-                action = "close" if not reenter_on_opposite else "entry"
-            else:
-                action = "scale"
-        elif pos_side == "short":
-            if side == "buy":
-                action = "close" if not reenter_on_opposite else "entry"
-            else:
-                action = "scale"
+    # Ensure markets are loaded (safe if called multiple times)
+    await ex.load_markets()
 
-    # 3) 실행
-    if action == "close":
-        # 반대 주문으로 size 만큼 청산
-        close_side = "buy" if side == "sell" else "sell"
-        return await place_order(ex, symbol, close_side, order_type, size, price, product_type)
-    elif action in {"entry", "scale"}:
-        return await place_order(ex, symbol, side, order_type, size, price, product_type)
-    else:
-        raise ValueError(f"unsupported intent: {intent}")
+    # Get current net position to decide reduceOnly
+    positions = await fetch_symbol_positions(ex, symbol)
+    net_qty = get_current_net_qty(positions)
+    reduce_only = get_reduce_only_flag(net_qty, side)
+
+    # Place order
+    try:
+        resp = await place_order(
+            ex=ex,
+            symbol=symbol,
+            side=side,
+            order_type=order_type,
+            size=size,
+            price=price,
+            reduce_only=reduce_only,
+            extra_params=extra_params,
+        )
+        return {"symbol": symbol, "side": side, "size": size, "reduceOnly": reduce_only, "id": resp.get("id")}
+    finally:
+        # Always close the client
+        try:
+            await ex.close()
+        except Exception:
+            pass
