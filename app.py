@@ -1,148 +1,109 @@
 import os
-from typing import Optional, Literal, Dict, Any, List
-import ccxt.async_support as ccxt
+from typing import Optional, Literal
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, validator
 
-# --- exchange bootstrap -------------------------------------------------------
-async def get_exchange():
-    # Accept multiple env var names to avoid deployment mismatches
-    key = (
-        os.getenv("BITGET_API_KEY")
-        or os.getenv("BITGET_KEY")
-        or os.getenv("API_KEY")
+# --- Safe import: import 오류가 나더라도 app 심볼은 항상 존재하게 ---
+try:
+    from trade import (
+        smart_route,
+        get_exchange,
+        normalize_symbol,
+        normalize_product_type,
     )
-    secret = (
-        os.getenv("BITGET_API_SECRET")
-        or os.getenv("BITGET_SECRET")
-        or os.getenv("API_SECRET")
-    )
-    # Bitget uses "password" for passphrase in CCXT
-    password = (
-        os.getenv("BITGET_PASSPHRASE")
-        or os.getenv("BITGET_API_PASSWORD")
-        or os.getenv("BITGET_PASSWORD")
-        or os.getenv("API_PASSWORD")
-        or os.getenv("PASSPHRASE")
-        or os.getenv("PASSWORD")
-    )
-    if not key or not secret or not password:
-        raise ValueError("Missing Bitget credentials (key/secret/password).")
+    _IMPORT_ERROR: Optional[str] = None
+except Exception as e:
+    # uvicorn이 "Attribute 'app' not found"로 뭉뚱그리지 않도록 원인 보존
+    smart_route = get_exchange = normalize_symbol = normalize_product_type = None  # type: ignore
+    _IMPORT_ERROR = f"import error in trade: {e!r}"
 
-    ex = ccxt.bitget(
-        {
-            "apiKey": key,
-            "secret": secret,
-            "password": password,
-            "enableRateLimit": True,
-            "options": {
-                # USDT-M perpetual
-                "defaultType": "swap",
-                "defaultSubType": "linear",
-            },
-        }
-    )
-    await ex.load_markets()
-    return ex
+app = FastAPI()
+application = app  # 일부 환경에서 application을 찾는 경우가 있어 함께 노출
+__all__ = ["app", "application"]
 
-# --- position helpers ---------------------------------------------------------
-async def fetch_symbol_positions(ex, symbol: str, product_type: str) -> List[Dict[str, Any]]:
-    params = {"productType": product_type}
-    try:
-        pos = await ex.fetch_positions([symbol], params)
-        return [p for p in pos if p.get("symbol") == symbol]
-    except Exception:
-        pos = await ex.fetch_positions(None, params)
-        return [p for p in pos if p.get("symbol") == symbol]
+def str_to_bool(value: Optional[str], default: bool = False) -> bool:
+    if value is None:
+        return default
+    v = value.strip().lower()
+    if v in {"1", "true", "yes", "y", "on"}:
+        return True
+    if v in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
-async def get_net_position(ex, symbol: str, product_type: str) -> float:
-    positions = await fetch_symbol_positions(ex, symbol, product_type)
-    net = 0.0
-    for p in positions:
-        side = (p.get("side") or p.get("positionSide") or "").lower()
-        contracts = p.get("contracts") or p.get("positionAmt") or p.get("size") or 0
-        try:
-            qty = float(contracts)
-        except Exception:
-            qty = 0.0
-        if side.startswith("long"):
-            net += qty
-        elif side.startswith("short"):
-            net -= qty
-    return net
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mySecret123!")
+REENTER_ON_OPPOSITE = str_to_bool(os.getenv("REENTER_ON_OPPOSITE"), False)
 
-# --- order helper -------------------------------------------------------------
-async def place(
-    ex,
-    symbol: str,
-    side: Literal["buy", "sell"],
-    order_type: Literal["market", "limit"],
-    size: float,
-    product_type: str,
-    reduce_only: bool = False,
-    price: Optional[float] = None,
-) -> Dict[str, Any]:
-    params = {"productType": product_type, "reduceOnly": reduce_only}
-    amount = float(size)
-    if order_type == "limit":
-        if price is None:
-            raise ValueError("price required for limit orders")
-        order = await ex.create_order(symbol, "limit", side, amount, price, params)
+# trade가 임포트 실패 시에도 서버는 기동되지만 /webhook 호출 시 상세 에러 반환
+def _guard_import():
+    if _IMPORT_ERROR is not None:
+        raise HTTPException(status_code=500, detail=_IMPORT_ERROR)
+
+DEFAULT_PRODUCT_TYPE = None
+try:
+    # normalize_product_type이 임포트에 실패했을 수 있으므로 가드
+    if normalize_product_type:
+        DEFAULT_PRODUCT_TYPE = normalize_product_type(os.getenv("PRODUCT_TYPE") or "umcbl")
     else:
-        order = await ex.create_order(symbol, "market", side, amount, None, params)
-    return {
-        "id": order.get("id"),
-        "reduceOnly": reduce_only,
-        "amount": amount,
-        "type": order_type,
-        "side": side,
-    }
+        DEFAULT_PRODUCT_TYPE = os.getenv("PRODUCT_TYPE") or "umcbl"
+except Exception:
+    DEFAULT_PRODUCT_TYPE = os.getenv("PRODUCT_TYPE") or "umcbl"
 
-# --- router -------------------------------------------------------------------
-async def smart_route(
-    ex,
-    symbol: str,
-    side: Literal["buy", "sell"],
-    order_type: Literal["market", "limit"],
-    size: float,
-    intent: Optional[Literal["entry", "scale", "close", "auto"]],
-    reenter_on_opposite: bool,
-    product_type: str,
-    price: Optional[float] = None,
-) -> Dict[str, Any]:
-    if intent is None:
-        intent = "auto"
+class Alert(BaseModel):
+    secret: str = Field(..., min_length=1)
+    symbol: str = Field(..., min_length=1)
+    side: Literal["buy", "sell"]
+    orderType: Literal["market", "limit"] = "market"
+    size: float = Field(..., gt=0)
+    intent: Optional[Literal["entry", "scale", "close", "auto"]] = "auto"
+    product_type: Optional[str] = None
+    price: Optional[float] = Field(default=None, gt=0)
 
-    net = await get_net_position(ex, symbol, product_type)
-    ops: List[Dict[str, Any]] = []
+    @validator("symbol")
+    def _strip_symbol(cls, v: str) -> str:
+        return v.strip()
 
-    # explicit close
-    if intent == "close":
-        ops.append(await place(ex, symbol, side, order_type, size, product_type, True, price))
-        return {"ops": ops, "net_before": net}
+@app.post("/webhook")
+async def webhook(alert: Alert):
+    _guard_import()
+    if alert.secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="invalid secret")
 
-    # explicit entry/scale
-    if intent in ("entry", "scale"):
-        ops.append(await place(ex, symbol, side, order_type, size, product_type, False, price))
-        return {"ops": ops, "net_before": net}
+    product_type = (normalize_product_type(alert.product_type) if normalize_product_type else alert.product_type) \
+                   or DEFAULT_PRODUCT_TYPE
+    if not product_type:
+        raise HTTPException(status_code=400, detail="product_type is required")
 
-    # auto
-    if net == 0:
-        ops.append(await place(ex, symbol, side, order_type, size, product_type, False, price))
-        return {"ops": ops, "net_before": net}
+    symbol_unified = normalize_symbol(alert.symbol) if normalize_symbol else alert.symbol
 
-    side_is_buy = side == "buy"
+    ex = await get_exchange()  # type: ignore
+    try:
+        result = await smart_route(  # type: ignore
+            ex=ex,
+            symbol=symbol_unified,
+            side=alert.side,
+            order_type=alert.orderType,
+            size=alert.size,
+            intent=alert.intent or "auto",
+            reenter_on_opposite=REENTER_ON_OPPOSITE,
+            product_type=product_type,
+            price=alert.price,
+        )
+        return {"ok": True, "result": result}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try:
+            await ex.close()
+        except Exception:
+            pass
 
-    # same-direction add
-    if (side_is_buy and net > 0) or ((not side_is_buy) and net < 0):
-        ops.append(await place(ex, symbol, side, order_type, size, product_type, False, price))
-        return {"ops": ops, "net_before": net}
-
-    # opposite-direction: close first, then optionally re-enter
-    qty_to_close = min(abs(net), float(size))
-    if qty_to_close > 0:
-        ops.append(await place(ex, symbol, side, order_type, qty_to_close, product_type, True, price))
-
-    remaining = float(size) - qty_to_close
-    if remaining > 0 and reenter_on_opposite:
-        ops.append(await place(ex, symbol, side, order_type, remaining, product_type, False, price))
-
-    return {"ops": ops, "net_before": net}
+@app.get("/health")
+async def health():
+    if _IMPORT_ERROR:
+        return {"ok": False, "detail": _IMPORT_ERROR}
+    return {"ok": True}
