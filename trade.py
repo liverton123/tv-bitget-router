@@ -1,222 +1,140 @@
 import os
-import re
-import logging
-from typing import Any, Dict, List, Optional, Tuple
+import math
+from typing import Dict, Optional, Set
 
 import ccxt.async_support as ccxt
 
-logger = logging.getLogger("tv-bitget-router.trade")
+BITGET_PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "umcbl").lower()  # USDT Perp
+MARGIN_MODE = os.getenv("MARGIN_MODE", "cross").lower()
 
-# --------- helpers ---------
-def _env(name: str, default: Optional[str] = None) -> Optional[str]:
-    v = os.getenv(name, default)
-    if v is None:
-        return None
-    v = v.strip()
-    if v == "" or v.lower() in ("none", "null"):
-        return None
-    return v
+API_KEY = os.getenv("bitget_api_key", "")
+API_SECRET = os.getenv("bitget_api_secret", "")
+API_PASSWORD = os.getenv("bitget_api_password", "")
 
-def _to_ccxt_symbol(tv_symbol: str) -> str:
-    """
-    TradingView: 'HBARUSDT' or 'HBARUSDT.P' -> ccxt: 'HBAR/USDT:USDT'
-    """
-    s = tv_symbol.upper().strip()
-    s = re.sub(r"\.[A-Za-z]+$", "", s)  # strip '.P' suffix if any
-    if s.endswith("USDT"):
-        base = s[:-4]
-        return f"{base}/USDT:USDT"
-    return tv_symbol
+ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() == "true"
 
-BITGET_PRODUCT_TYPE = _env("bitget_product_type", "USDT-FUTURES") or "USDT-FUTURES"
-DEFAULT_LEVERAGE = float(_env("DEFAULT_LEVERAGE", "10") or "10")  # fallback leverage for first entry
 
-# --------- exchange factory ---------
 async def get_exchange() -> ccxt.bitget:
-    api_key = _env("bitget_api_key")
-    api_secret = _env("bitget_api_secret")
-    api_password = _env("bitget_api_password")
-
-    if not (api_key and api_secret and api_password):
+    if not (API_KEY and API_SECRET and API_PASSWORD):
         raise ValueError("Missing Bitget credentials (key/secret/password).")
-
     ex = ccxt.bitget({
-        "apiKey": api_key,
-        "secret": api_secret,
-        "password": api_password,
+        "apiKey": API_KEY,
+        "secret": API_SECRET,
+        "password": API_PASSWORD,
         "enableRateLimit": True,
         "options": {
             "defaultType": "swap",
-            "defaultSubType": "linear",
-            # hint for bitget mix endpoints
-            "defaultProductType": BITGET_PRODUCT_TYPE,
+            "productType": BITGET_PRODUCT_TYPE,
         },
     })
     await ex.load_markets()
     return ex
 
-# --------- portfolio/position ---------
-async def fetch_positions(ex: ccxt.bitget, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-    params = {"productType": BITGET_PRODUCT_TYPE}
+
+def to_exchange_symbol(raw: str) -> str:
+    s = raw.replace(" ", "").upper()
+    if s.endswith(".P"):
+        s = s[:-2]
+    if s.endswith("USDT"):
+        base = s[:-4]
+        return f"{base}/USDT:USDT"
+    return s
+
+
+async def ensure_leverage(ex: ccxt.bitget, symbol: str, lev: int, margin_mode: str = "cross"):
     try:
-        if symbol:
-            return await ex.fetch_positions([symbol], params)
-        return await ex.fetch_positions(None, params)
+        await ex.set_margin_mode(margin_mode, symbol)
     except Exception:
-        # some ccxt versions behave differently; fallback to all
-        return await ex.fetch_positions(None, params)
+        pass
+    try:
+        await ex.set_leverage(lev, symbol)
+    except Exception:
+        pass
 
-def net_position_for_symbol(positions: List[Dict[str, Any]], ccxt_symbol: str) -> Tuple[float, Optional[str], Optional[float]]:
-    """
-    Returns (net_contracts, side('long'|'short'|None), leverage_if_available)
-    """
-    net = 0.0
-    side: Optional[str] = None
-    lev: Optional[float] = None
+
+async def _market_info(ex: ccxt.bitget, symbol: str) -> Dict:
+    m = ex.market(symbol)
+    return {
+        "precision_amount": m.get("precision", {}).get("amount", m.get("precision", {}).get("contract", 0)),
+        "limits_amount_min": (m.get("limits", {}).get("amount", {}) or {}).get("min", 0),
+    }
+
+
+async def _round_amount(ex: ccxt.bitget, symbol: str, amount: float) -> float:
+    info = await _market_info(ex, symbol)
+    prec = info["precision_amount"]
+    if prec and prec > 0:
+        step = 10 ** (-prec)
+        amount = math.floor(amount / step) * step
+    min_amt = info["limits_amount_min"]
+    if min_amt:
+        amount = max(amount, min_amt)
+    return max(amount, 0)
+
+
+async def _price(ex: ccxt.bitget, symbol: str) -> float:
+    t = await ex.fetch_ticker(symbol)
+    return float(t["last"])
+
+
+async def get_position_info(ex: ccxt.bitget, symbol: str) -> Dict:
+    side = "none"
+    contracts = 0.0
+    notional = 0.0
+    entry_price = 0.0
+    try:
+        positions = await ex.fetch_positions([symbol])
+        for p in positions:
+            if p.get("symbol") == symbol and float(p.get("contracts", 0)) != 0:
+                contracts = abs(float(p.get("contracts")))
+                notional = float(p.get("notional", 0) or 0)
+                entry_price = float(p.get("entryPrice", 0) or 0)
+                side = p.get("side") or ("long" if float(p.get("contracts")) > 0 else "short")
+                break
+    except Exception:
+        pass
+    return {"side": side, "contracts": contracts, "notional": notional, "entry_price": entry_price}
+
+
+async def get_open_positions_count(ex: ccxt.bitget) -> int:
+    """현재 열려있는 '심볼' 개수(중복 제거)"""
+    try:
+        positions = await ex.fetch_positions()
+    except Exception:
+        return 0
+    active: Set[str] = set()
     for p in positions:
-        if p.get("symbol") != ccxt_symbol:
-            continue
-        contracts = float(p.get("contracts") or p.get("size") or 0.0)
-        pside = (p.get("side") or "").lower() or None
-        if pside in ("long", "short"):
-            side = pside
-            signed = contracts if pside == "long" else -contracts
-            net += signed
-        if lev is None:
-            try:
-                lev = float(p.get("leverage") or p.get("info", {}).get("leverage"))
-            except Exception:
-                lev = None
-    if net == 0:
-        side = None
-    return net, side, lev
-
-# --------- sizing with fixed margin ---------
-async def _fetch_mid_price(ex: ccxt.bitget, ccxt_symbol: str) -> float:
-    t = await ex.fetch_ticker(ccxt_symbol)
-    price = t.get("last") or ( (t.get("bid") or 0) + (t.get("ask") or 0) ) / 2
-    price = float(price)
-    if price <= 0:
-        raise ValueError(f"invalid price for {ccxt_symbol}")
-    return price
-
-async def compute_entry_amount_fixed_margin(
-    ex: ccxt.bitget,
-    ccxt_symbol: str,
-    target_margin_usdt: float,
-    leverage_hint: Optional[float],
-) -> float:
-    """
-    amount = (target_margin * effective_leverage) / price
-    If leverage is unknown on first entry, use DEFAULT_LEVERAGE.
-    """
-    price = await _fetch_mid_price(ex, ccxt_symbol)
-    lev = float(leverage_hint) if leverage_hint and leverage_hint > 0 else DEFAULT_LEVERAGE
-    notional = target_margin_usdt * lev
-    raw_amount = notional / price
-
-    # precision & min-amount guard
-    amount = float(ex.amount_to_precision(ccxt_symbol, raw_amount))
-    min_amt = (ex.markets[ccxt_symbol].get("limits", {}).get("amount", {}) or {}).get("min")
-    if min_amt is not None:
         try:
-            min_amt = float(min_amt)
+            if float(p.get("contracts", 0)) != 0:
+                active.add(p.get("symbol"))
         except Exception:
-            min_amt = None
-    if min_amt and amount < min_amt:
-        logger.info(f"SKIP_TOO_SMALL symbol={ccxt_symbol} raw={raw_amount} prec={amount} min={min_amt}")
-        return 0.0
-    return amount
+            continue
+    return len(active)
 
-# --------- order placement ---------
-async def place_market(
+
+async def place_order_market(
     ex: ccxt.bitget,
-    ccxt_symbol: str,
-    side: str,
-    amount: float,
-    reduce_only: bool,
-    extra: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    if amount <= 0:
-        return {"status": "skipped", "reason": "too_small"}
-    params = {"productType": BITGET_PRODUCT_TYPE, "reduceOnly": reduce_only}
-    if extra:
-        params.update(extra)
-    logger.info(f"ORDER symbol={ccxt_symbol} side={side} amt={amount} reduceOnly={reduce_only}")
-    o = await ex.create_order(ccxt_symbol, "market", side, amount, None, params)
-    return {"status": "filled", "id": o.get("id"), "amount": amount, "reduceOnly": reduce_only}
-
-# --------- router ---------
-async def smart_route(
-    exchange: ccxt.bitget,
     symbol: str,
     side: str,
-    order_type: str,
-    size: float,
-    raw: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """
-    - Entry/Scale: ignore incoming 'size' and use fixed margin sizing (6 USDT) with effective leverage.
-    - Opposite signal: close first with reduceOnly, then (if leftover) open remainder using fixed sizing.
-    """
-    if order_type.lower() != "market":
-        raise ValueError("Only market orders are supported")
+    *,
+    contracts: Optional[float] = None,
+    fixed_margin_usdt: Optional[float] = None,
+    reduce_only: bool = False,
+) -> float:
+    if fixed_margin_usdt is not None:
+        px = await _price(ex, symbol)
+        if px <= 0:
+            raise ValueError("Failed to fetch price")
+        raw_qty = fixed_margin_usdt / px
+    else:
+        if contracts is None or contracts <= 0:
+            raise ValueError("contracts or fixed_margin_usdt required")
+        raw_qty = float(contracts)
 
-    ccxt_symbol = _to_ccxt_symbol(symbol)
-    # make sure market exists
-    market = exchange.market(ccxt_symbol) if ccxt_symbol in exchange.markets else None
-    if market is None:
-        # attempt load/refresh then retry
-        await exchange.load_markets()
-        if ccxt_symbol not in exchange.markets:
-            raise ValueError(f"Unknown market symbol {ccxt_symbol}")
+    qty = await _round_amount(ex, symbol, raw_qty)
+    if qty <= 0:
+        raise ValueError("Quantity after rounding is zero")
 
-    positions = await fetch_positions(exchange)
-    net, pos_side, lev_from_pos = net_position_for_symbol(positions, ccxt_symbol)
-
-    # classify intent using current position and incoming side
-    incoming = side.lower().strip()
-    same_dir = (pos_side == "long" and incoming == "buy") or (pos_side == "short" and incoming == "sell")
-    opposite_dir = (pos_side == "long" and incoming == "sell") or (pos_side == "short" and incoming == "buy")
-
-    FIXED_MARGIN_USDT = float(_env("FIXED_MARGIN_USDT", "6") or "6")
-
-    results: List[Dict[str, Any]] = []
-
-    if net == 0 or pos_side is None:
-        # fresh entry
-        amt = await compute_entry_amount_fixed_margin(exchange, ccxt_symbol, FIXED_MARGIN_USDT, lev_from_pos)
-        if amt == 0:
-            return {"ok": True, "results": [{"decision": "SKIP_ENTRY_TOO_SMALL"}]}
-        r = await place_market(exchange, ccxt_symbol, incoming, amt, reduce_only=False)
-        results.append({"decision": "OPEN_LONG" if incoming == "buy" else "OPEN_SHORT", **r})
-        return {"ok": True, "results": results}
-
-    if same_dir:
-        # scale-in with fixed margin sizing
-        amt = await compute_entry_amount_fixed_margin(exchange, ccxt_symbol, FIXED_MARGIN_USDT, lev_from_pos)
-        if amt == 0:
-            return {"ok": True, "results": [{"decision": "SKIP_SCALE_TOO_SMALL"}]}
-        r = await place_market(exchange, ccxt_symbol, incoming, amt, reduce_only=False)
-        results.append({"decision": "SCALE_IN_LONG" if incoming == "buy" else "SCALE_IN_SHORT", **r})
-        return {"ok": True, "results": results}
-
-    if opposite_dir:
-        # close as much as possible first
-        close_side = "sell" if pos_side == "long" else "buy"
-        close_amt = float(abs(net))
-        close_amt = float(exchange.amount_to_precision(ccxt_symbol, close_amt))
-        if close_amt > 0:
-            r_close = await place_market(exchange, ccxt_symbol, close_side, close_amt, reduce_only=True)
-            results.append({"decision": "CLOSE_ALL", **r_close})
-
-        # after full close, if strategy intends to flip immediately, open with fixed margin sizing
-        amt = await compute_entry_amount_fixed_margin(exchange, ccxt_symbol, FIXED_MARGIN_USDT, lev_from_pos)
-        if amt > 0:
-            r_open = await place_market(exchange, ccxt_symbol, incoming, amt, reduce_only=False)
-            results.append({"decision": "FLIP_OPEN", **r_open})
-
-        return {"ok": True, "results": results}
-
-    # Fallback (should not hit)
-    return {"ok": True, "results": [{"decision": "NOOP"}]}
+    params = {"reduceOnly": reduce_only}
+    order = await ex.create_order(symbol, "market", side, qty, None, params)
+    return float(order.get("
