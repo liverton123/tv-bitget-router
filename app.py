@@ -1,111 +1,181 @@
 import os
 import json
-import logging
 from typing import Any, Dict
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
+import uvicorn
 
-from trade import get_exchange, smart_route
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+from trade import (
+    get_exchange,
+    get_position_info,
+    get_open_positions_count,
+    place_order_market,
+    ensure_leverage,
+    to_exchange_symbol,
 )
-logger = logging.getLogger("tv-bitget-router")
 
-app = FastAPI()
+app = FastAPI(title="tv-bitget-router")
+
+# ---- env ----
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() == "true"
+REENTER_ON_OPPOSITE = os.getenv("REENTER_ON_OPPOSITE", "false").lower() == "true"
+CLOSE_TOLERANCE_PCT = float(os.getenv("CLOSE_TOLERANCE_PCT", "0.02"))
+REQUIRE_INTENT_FOR_OPEN = os.getenv("REQUIRE_INTENT_FOR_OPEN", "true").lower() == "true"
+FORCE_FIXED_SIZING = os.getenv("FORCE_FIXED_SIZING", "true").lower() == "true"
+FIXED_MARGIN_USDT = float(os.getenv("FIXED_MARGIN_USDT", "6"))
+DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "10"))
+MARGIN_MODE = os.getenv("MARGIN_MODE", "cross").lower()  # cross | isolated
+MAX_COINS = int(os.getenv("MAX_COINS", "5"))
 
 
-def _env(name: str, default: str | None = None) -> str | None:
-    """환경변수 헬퍼 (공백·'null' 같은 값도 비어있는 것으로 취급)."""
-    v = os.getenv(name, default)
-    if v is None:
-        return None
-    v = v.strip()
-    if v == "" or v.lower() in ("none", "null"):
-        return None
+def _safe(payload: Dict[str, Any], key: str, default=None):
+    v = payload.get(key, default)
+    if isinstance(v, str):
+        v = v.strip()
     return v
 
 
+def _dir_from_side(side: str) -> str:
+    return "long" if side.lower() == "buy" else "short"
+
+
+def approx_equal(a: float, b: float, tol: float) -> bool:
+    if b == 0:
+        return abs(a) < 1e-8
+    return abs(a - b) <= abs(b) * tol
+
+
 @app.post("/webhook")
-async def webhook(request: Request) -> JSONResponse:
-    """
-    TradingView 웹훅을 받아 Bitget에 라우팅.
-    - 요청 본문은 JSON
-    - 필수: secret (옵션), symbol, side, orderType, size
-    """
-    body: Dict[str, Any]
+async def webhook(request: Request):
+    # ---- parsing ----
     try:
-        body = await request.json()
+        payload = await request.json()
     except Exception:
-        # TV가 가끔 text로 보낼 때 대비
-        raw = await request.body()
+        body = await request.body()
         try:
-            body = json.loads(raw.decode("utf-8"))
+            payload = json.loads(body.decode("utf-8"))
         except Exception:
-            raise HTTPException(status_code=400, detail="Invalid JSON payload")
+            raise HTTPException(400, "Invalid JSON")
 
-    logger.info("webhook payload: %s", body)
+    # ---- auth ----
+    incoming_secret = str(_safe(payload, "secret", ""))
+    if WEBHOOK_SECRET and incoming_secret != WEBHOOK_SECRET:
+        raise HTTPException(403, "Forbidden (secret mismatch)")
 
-    # (선택) 시크릿 검증: 환경변수 SECRET이 설정된 경우에만 검사
-    expected_secret = _env("SECRET")
-    if expected_secret is not None:
-        recv_secret = str(body.get("secret", "")).strip()
-        if recv_secret != expected_secret:
-            raise HTTPException(status_code=401, detail="Invalid secret")
+    raw_symbol = str(_safe(payload, "symbol", "") or _safe(payload, "ticker", ""))
+    if not raw_symbol:
+        raise HTTPException(400, "Missing symbol")
 
-    # 필드 정규화 (TradingView 템플릿 가정)
-    symbol = str(body.get("symbol") or body.get("ticker") or "").strip()
-    side = str(body.get("side") or body.get("action") or "").strip().lower()
-    order_type = str(body.get("orderType") or "market").strip().lower()
-    size = body.get("size") or body.get("contracts") or body.get("qty") or 0
+    side = str(_safe(payload, "side", "")).lower()  # buy/sell
+    if side not in ("buy", "sell"):
+        raise HTTPException(400, "Missing/invalid side")
 
-    if not symbol or not side or not order_type:
-        raise HTTPException(status_code=400, detail="Missing required fields")
+    order_type = str(_safe(payload, "orderType", "market")).lower()
+    if order_type != "market":
+        raise HTTPException(400, "Only market orders supported")
 
-    # 숫자 변환 실패 방지
-    try:
-        size = float(size)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid size")
+    incoming_size = float(_safe(payload, "size", 0) or 0)
+    intent = str(_safe(payload, "intent", "") or "").lower()  # 'open'|'add'|'close'|''
 
-    if size <= 0:
-        raise HTTPException(status_code=400, detail="Size must be > 0")
+    ex = await get_exchange()
+    ex_symbol = to_exchange_symbol(raw_symbol)
 
-    # Bitget 인증값 검증을 일찍 수행해 400 반복로그 방지
-    api_key = _env("bitget_api_key")
-    api_secret = _env("bitget_api_secret")
-    api_password = _env("bitget_api_password")
-    if not (api_key and api_secret and api_password):
-        logger.error("Missing Bitget credentials (key/secret/password).")
-        raise HTTPException(status_code=400, detail="Missing Bitget credentials")
+    # 현재 심볼 포지션
+    pos = await get_position_info(ex, ex_symbol)
+    pos_side = pos["side"]             # 'none'|'long'|'short'
+    pos_size = pos["contracts"]        # >0 일 때만 의미
+    incoming_dir = _dir_from_side(side)
 
-    # 거래 실행
-    exchange = None
-    try:
-        exchange = await get_exchange()  # 내부에서 env 사용
-        result = await smart_route(
-            exchange=exchange,
-            symbol=symbol,
-            side=side,
-            order_type=order_type,
-            size=size,
-            raw=body,
+    # ---- 분류 ----
+    action = None           # 'OPEN'|'ADD'|'CLOSE'|'FLIP'
+    reduce_only = False
+
+    if intent == "close":
+        action = "CLOSE"
+        reduce_only = True
+
+    elif pos_side != "none":
+        # 포지션 있음
+        if incoming_dir == pos_side:
+            action = "ADD"
+        else:
+            if incoming_size == 0 or approx_equal(incoming_size, pos_size, CLOSE_TOLERANCE_PCT):
+                action = "CLOSE"
+                reduce_only = True
+            else:
+                action = "FLIP" if REENTER_ON_OPPOSITE else "CLOSE"
+                reduce_only = True
+
+    else:
+        # 포지션 없음
+        if REQUIRE_INTENT_FOR_OPEN and intent != "open":
+            await ex.close()
+            return JSONResponse({"status": "ignored", "reason": "no position & no open intent"}, 200)
+
+        # MAX_COINS 제한 체크 (심볼 신규 진입만 제한)
+        open_count = await get_open_positions_count(ex)
+        if open_count >= MAX_COINS:
+            await ex.close()
+            return JSONResponse({"status": "ignored", "reason": "max coins reached"}, 200)
+
+        action = "OPEN"
+
+    # ---- 실행 ----
+    qty = None
+    if action in ("OPEN", "ADD"):
+        # 레버리지/마진모드 보정
+        await ensure_leverage(ex, ex_symbol, DEFAULT_LEVERAGE, MARGIN_MODE)
+
+        if FORCE_FIXED_SIZING:
+            qty = await place_order_market(
+                ex, ex_symbol, side,
+                fixed_margin_usdt=FIXED_MARGIN_USDT,
+                reduce_only=False,
+            )
+        else:
+            if incoming_size <= 0:
+                await ex.close()
+                raise HTTPException(400, "Missing size")
+            qty = await place_order_market(
+                ex, ex_symbol, side,
+                contracts=incoming_size,
+                reduce_only=False,
+            )
+
+    elif action == "CLOSE":
+        if pos_side == "none":
+            await ex.close()
+            return JSONResponse({"status": "ignored", "reason": "no position to close"}, 200)
+        close_side = "sell" if pos_side == "long" else "buy"
+        qty = await place_order_market(
+            ex, ex_symbol, close_side,
+            contracts=pos_size,
+            reduce_only=True,
         )
-        logger.info("order result: %s", result)
-        return JSONResponse({"ok": True, "result": result})
-    except HTTPException:
-        # FastAPI 예외는 그대로
-        raise
-    except Exception as e:
-        logger.exception("Unhandled error while routing order")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        # ccxt async 자원 해제 (로그에서 반복 경고 나왔던 부분)
-        if exchange is not None:
-            try:
-                await exchange.close()
-                logger.info("Closed client session & connector")
-            except Exception:
-                logger.warning("exchange.close() failed", exc_info=True)
+
+    elif action == "FLIP":
+        close_side = "sell" if pos_side == "long" else "buy"
+        await place_order_market(
+            ex, ex_symbol, close_side,
+            contracts=pos_size,
+            reduce_only=True,
+        )
+        await ensure_leverage(ex, ex_symbol, DEFAULT_LEVERAGE, MARGIN_MODE)
+        qty = await place_order_market(
+            ex, ex_symbol,
+            "buy" if pos_side == "short" else "sell",
+            fixed_margin_usdt=FIXED_MARGIN_USDT,
+            reduce_only=False,
+        )
+
+    await ex.close()
+    return JSONResponse(
+        {"status": "ok", "symbol": ex_symbol, "classified": action, "reduceOnly": reduce_only, "qty": qty},
+        200,
+    )
+
+
+if __name__ == "__main__":
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
