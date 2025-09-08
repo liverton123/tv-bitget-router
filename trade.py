@@ -137,4 +137,4 @@ async def place_order_market(
 
     params = {"reduceOnly": reduce_only}
     order = await ex.create_order(symbol, "market", side, qty, None, params)
-    return float(order.get("
+    return float(order.get("amount") or qty)
