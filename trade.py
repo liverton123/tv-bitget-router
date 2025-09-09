@@ -1,70 +1,68 @@
 import os
 import math
 import time
-from typing import Optional, Tuple, Literal, Dict, Any
+import json
+from typing import Dict, Tuple, Literal, Any
 
 import asyncio
 import aiohttp
+from urllib.parse import urlencode
 
+# ===== 환경 =====
 BITGET_BASE = "https://api.bitget.com"
-PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "umcbl")  # U本位 永续
+PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "umcbl")  # USDT-M perpetual
 MARGIN_COIN = "USDT"
 
 API_KEY = os.getenv("bitget_api_key")
 API_SECRET = os.getenv("bitget_api_secret")
 API_PASSWORD = os.getenv("bitget_api_password")
 
-# 고정 마진(USDT)
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+
+ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() == "true"
+MAX_COINS = int(os.getenv("MAX_COINS", "5"))
+CLOSE_TOLERANCE_PCT = float(os.getenv("CLOSE_TOLERANCE_PCT", "0.02"))
+
+# 고정 마진 $6
 FORCE_FIXED_SIZING = os.getenv("FORCE_FIXED_SIZING", "true").lower() == "true"
 FIXED_MARGIN_USD = float(os.getenv("FIXED_MARGIN_USD", "6"))
 
-# 재진입/반대 신호 처리
-REQUIRE_INTENT_FOR_OPEN = os.getenv("REQUIRE_INTENT_FOR_OPEN", "true").lower() == "true"
-MAX_COINS = int(os.getenv("MAX_COINS", "5"))
-
-ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() == "true"
-CLOSE_TOLERANCE_PCT = float(os.getenv("CLOSE_TOLERANCE_PCT", "0.02"))
-
-# 최소/스텝 정보 캐시
-symbol_meta_cache: Dict[str, Dict[str, float]] = {}
-# 현재 보유(심볼→("long"|"short", qty))
-position_cache: Dict[str, Tuple[str, float]] = {}
-pos_cache_ts = 0.0
+# ===== 캐시 =====
+_symbol_meta: Dict[str, Dict[str, float]] = {}
+_position_cache: Dict[str, Tuple[str, float]] = {}
+_pos_cache_ts = 0.0
 
 
-def now_ms() -> int:
-    return int(time.time() * 1000)
+def _now_ms() -> str:
+    return str(int(time.time() * 1000))
 
 
-def normalize_symbol(tv_symbol: str) -> str:
-    # VINEUSDT.P, SUIUSDT.P 등 접미사 제거
-    s = tv_symbol.upper().strip()
-    for suf in (".P", ".PERP", "-PERP"):
-        if s.endswith(suf):
-            s = s[: -len(suf)]
-    return s
+async def _request(
+    session: aiohttp.ClientSession,
+    method: Literal["GET", "POST"],
+    path: str,
+    params: Dict[str, Any] | None = None,
+    body_json: Dict[str, Any] | None = None,
+    auth: bool = False,
+) -> Any:
+    """
+    Bitget v2 표준 서명. (문제 없게 단순화)
+    prehash = ts + method + requestPath(+query) + body
+    sign   = Base64(HMAC_SHA256(secret, prehash))
+    """
+    method = method.upper()
+    query = "" if not params else "?" + urlencode(params, doseq=True)
+    request_path = path + query
+    url = BITGET_BASE + request_path
 
+    headers = {"Content-Type": "application/json"}
+    body_str = "" if body_json is None else json.dumps(body_json, separators=(",", ":"))
 
-def sign(params: Dict[str, str]) -> str:
-    import hmac, hashlib
-
-    # Bitget v2 서명 규칙 (query/body + timestamp)
-    ts = str(now_ms())
-    params["timestamp"] = ts
-    message = ts + "POST" + "/api/v2/mix/order/place-order" + (params.get("body") or "")
-    return ts, hmac.new(API_SECRET.encode(), message.encode(), hashlib.sha256).hexdigest()
-
-
-async def http(session: aiohttp.ClientSession, method: str, path: str, params=None, json=None, auth=False):
-    url = BITGET_BASE + path
-    headers = {}
     if auth:
-        # v2 공통 헤더 (Bitget 최신 사양)
-        ts = str(now_ms())
-        body = "" if json is None else aiohttp.payload.JsonPayload(json).buffer.decode()
-        prehash = ts + method.upper() + path + (("" if method.upper() == "GET" else body))
         import hmac, hashlib, base64
 
+        ts = _now_ms()
+        prehash = ts + method + path + query + ("" if method == "GET" else body_str)
         sign = base64.b64encode(hmac.new(API_SECRET.encode(), prehash.encode(), hashlib.sha256).digest()).decode()
         headers.update(
             {
@@ -72,117 +70,118 @@ async def http(session: aiohttp.ClientSession, method: str, path: str, params=No
                 "ACCESS-SIGN": sign,
                 "ACCESS-PASSPHRASE": API_PASSWORD,
                 "ACCESS-TIMESTAMP": ts,
-                "Content-Type": "application/json",
                 "locale": "en-US",
             }
         )
 
-    async with session.request(method, url, params=params, json=json, headers=headers, timeout=20) as r:
-        data = await r.json(content_type=None)
-        return data
+    try:
+        async with session.request(method, url, data=(None if method == "GET" else body_str), headers=headers, timeout=20) as r:
+            # Bitget는 종종 text로 돌려주므로 안전 파싱
+            text = await r.text()
+            try:
+                data = json.loads(text)
+            except Exception:
+                data = {"code": str(r.status), "raw": text}
+            return data
+    except asyncio.TimeoutError:
+        return {"code": "timeout", "msg": "request timeout"}
+    except Exception as e:
+        return {"code": "error", "msg": f"{type(e).__name__}"}
 
 
-async def fetch_positions(session: aiohttp.ClientSession) -> Dict[str, Tuple[str, float]]:
-    """
-    심볼별 현재 포지션 (방향, 수량) 반환. 없으면 미포함.
-    """
-    global position_cache, pos_cache_ts
-    if time.time() - pos_cache_ts < 2.0 and position_cache:
-        return position_cache
+async def _fetch_positions(session: aiohttp.ClientSession) -> Dict[str, Tuple[str, float]]:
+    """심볼 -> (방향, 수량)"""
+    global _position_cache, _pos_cache_ts
+    if time.time() - _pos_cache_ts < 2 and _position_cache:
+        return _position_cache
 
     out: Dict[str, Tuple[str, float]] = {}
 
-    # Bitget v2 positions
-    params = {"productType": PRODUCT_TYPE, "marginCoin": MARGIN_COIN}
-    data = await http(session, "GET", "/api/v2/mix/position/single-position-v2", params=params, auth=True)
-    # 일부 계정에서 single-position-v2가 아닌 전체목록 엔드포인트 필요
-    if not isinstance(data, dict) or data.get("code") != "00000":
-        data = await http(session, "GET", "/api/v2/mix/position/all-position", params={"productType": PRODUCT_TYPE}, auth=True)
-
+    data = await _request(session, "GET", "/api/v2/mix/position/all-position", params={"productType": PRODUCT_TYPE}, auth=True)
     if isinstance(data, dict) and data.get("code") == "00000":
-        rows = data.get("data") or []
-        for row in rows:
-            symbol = (row.get("symbol") or row.get("instId") or "").upper()
-            size = float(row.get("total") or row.get("holdVol") or 0)
-            side = "long" if (row.get("holdSide") in ("long", "BUY", "buy")) else "short" if size > 0 else ""
-            if size > 0 and side:
-                out[symbol] = (side, size)
+        for row in data.get("data") or []:
+            sym = (row.get("symbol") or "").upper()
+            sz = float(row.get("total") or row.get("holdVol") or 0)
+            side_raw = (row.get("holdSide") or "").lower()
+            if sz > 0:
+                side = "long" if side_raw in ("long", "buy") else "short"
+                out[sym] = (side, sz)
 
-    position_cache = out
-    pos_cache_ts = time.time()
+    _position_cache = out
+    _pos_cache_ts = time.time()
     return out
 
 
-async def fetch_symbol_meta(session: aiohttp.ClientSession, symbol: str) -> Dict[str, float]:
-    """
-    최소 수량, 수량 스텝, 가격 스텝 정보
-    """
-    if symbol in symbol_meta_cache:
-        return symbol_meta_cache[symbol]
+async def _fetch_symbol_meta(session: aiohttp.ClientSession, symbol: str) -> Dict[str, float]:
+    """최소 수량/스텝/가격 스텝"""
+    if symbol in _symbol_meta:
+        return _symbol_meta[symbol]
 
-    params = {"productType": PRODUCT_TYPE}
-    data = await http(session, "GET", "/api/v2/mix/market/contracts", params=params)
-    min_qty = 0.0001
-    qty_step = 0.0001
-    price_step = 0.0001
-
+    data = await _request(session, "GET", "/api/v2/mix/market/contracts", params={"productType": PRODUCT_TYPE})
+    min_qty, qty_step, price_step = 0.0001, 0.0001, 0.0001
     if isinstance(data, dict) and data.get("code") == "00000":
-        for it in data.get("data", []):
-            if (it.get("symbol") or it.get("instId") or "").upper() == symbol:
+        for it in data.get("data") or []:
+            if (it.get("symbol") or "").upper() == symbol:
                 min_qty = float(it.get("minTradeNum") or min_qty)
+                # sizeMultiplier 가 수량 스텝 역할
                 qty_step = float(it.get("sizeMultiplier") or qty_step)
-                price_step = float(it.get("pricePlace") or 4)
-                # price_place 가 자리수면 스텝으로 변환
-                if price_step > 1:
-                    price_step = 10 ** (-int(price_step))
+                pp = it.get("pricePlace")
+                if pp is not None:
+                    price_step = 10 ** (-int(pp))
                 break
-
     meta = {"min_qty": min_qty, "qty_step": qty_step, "price_step": price_step}
-    symbol_meta_cache[symbol] = meta
+    _symbol_meta[symbol] = meta
     return meta
 
 
-def round_step(x: float, step: float) -> float:
+async def _fetch_last_price(session: aiohttp.ClientSession, symbol: str) -> float:
+    data = await _request(session, "GET", "/api/v2/mix/market/ticker", params={"symbol": symbol, "productType": PRODUCT_TYPE})
+    if isinstance(data, dict) and data.get("code") == "00000":
+        d = data.get("data") or {}
+        for k in ("lastPr", "last", "close"):
+            if d.get(k):
+                return float(d[k])
+    return 0.0
+
+
+async def _get_user_leverage(session: aiohttp.ClientSession, symbol: str, default_lev: float = 10.0) -> float:
+    """조회 실패해도 절대 예외 안나게"""
+    data = await _request(session, "GET", "/api/v2/mix/account/account", params={"productType": PRODUCT_TYPE, "marginCoin": MARGIN_COIN}, auth=True)
+    if isinstance(data, dict) and data.get("code") == "00000":
+        for row in data.get("data") or []:
+            if (row.get("symbol") or "").upper() == symbol:
+                for k in ("leverage", "crossLeverage", "fixLeverage"):
+                    try:
+                        v = float(row.get(k) or 0)
+                        if v > 0:
+                            return v
+                    except Exception:
+                        pass
+    return default_lev
+
+
+def _round_step(x: float, step: float) -> float:
     if step <= 0:
         return x
     return math.floor(x / step) * step
 
 
-def compute_qty_from_margin(price: float, leverage: float, margin_usd: float, min_qty: float, qty_step: float) -> float:
+def _qty_from_margin(price: float, leverage: float, margin_usd: float, min_qty: float, qty_step: float) -> float:
     notional = leverage * margin_usd
     qty = max(min_qty, notional / max(price, 1e-12))
-    qty = round_step(qty, qty_step)
-    return qty
+    return _round_step(qty, qty_step)
 
 
-async def get_symbol_leverage(session: aiohttp.ClientSession, symbol: str, default_leverage: float = 10.0) -> float:
-    """
-    심볼별 현재 레버리지(사용자가 거래소 UI에서 설정한 값). 조회 실패시 기본값 10.
-    """
-    data = await http(session, "GET", "/api/v2/mix/account/account", params={"productType": PRODUCT_TYPE, "marginCoin": MARGIN_COIN}, auth=True)
-    if isinstance(data, dict) and data.get("code") == "00000":
-        for row in data.get("data", []):
-            if (row.get("symbol") or "").upper() == symbol:
-                try:
-                    lev = float(row.get("leverage") or row.get("crossLeverage") or default_leverage)
-                    if lev > 0:
-                        return lev
-                except:
-                    pass
-    return default_leverage
+def _normalize_symbol(tv_symbol: str) -> str:
+    s = tv_symbol.upper().strip()
+    for suf in (".P", ".PERP", "-PERP"):
+        if s.endswith(suf):
+            s = s[: -len(suf)]
+    return s
 
 
-async def fetch_last_price(session: aiohttp.ClientSession, symbol: str) -> float:
-    data = await http(session, "GET", "/api/v2/mix/market/ticker", params={"symbol": symbol, "productType": PRODUCT_TYPE})
-    if isinstance(data, dict) and data.get("code") == "00000":
-        d = (data.get("data") or {})
-        return float(d.get("lastPr") or d.get("last") or d.get("close") or 0.0)
-    return 0.0
-
-
-def decide_intent(current: Dict[str, Tuple[str, float]], symbol: str, side: Literal["buy", "sell"]) -> Literal["entry", "dca", "exit"]:
-    s = symbol.upper()
-    have = current.get(s)
+def _decide_intent(current: Dict[str, Tuple[str, float]], symbol: str, side: Literal["buy", "sell"]) -> Literal["entry", "dca", "exit"]:
+    have = current.get(symbol)
     if not have:
         return "entry"
     pos_side, _ = have
@@ -191,81 +190,81 @@ def decide_intent(current: Dict[str, Tuple[str, float]], symbol: str, side: Lite
     return "exit"
 
 
-async def count_distinct_symbols(session: aiohttp.ClientSession) -> int:
-    pos = await fetch_positions(session)
-    return len(pos.keys())
-
-
-async def place_market_order(session: aiohttp.ClientSession, symbol: str, side: Literal["buy", "sell"], qty: float, reduce_only: bool):
+async def _place_market(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    side: Literal["buy", "sell"],
+    qty: float,
+    reduce_only: bool,
+) -> Any:
     body = {
         "symbol": symbol,
         "productType": PRODUCT_TYPE,
         "marginCoin": MARGIN_COIN,
         "size": str(qty),
-        "price": None,
         "orderType": "market",
-        "side": "buy" if side == "buy" else "sell",
+        "side": side,
         "reduceOnly": True if reduce_only else False,
     }
-    data = await http(session, "POST", "/api/v2/mix/order/place-order", json=body, auth=True)
-    return data
+    return await _request(session, "POST", "/api/v2/mix/order/place-order", body_json=body, auth=True)
 
 
 async def handle_signal(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    payload: { secret, symbol, side, orderType, size }
+    payload 예: {secret, symbol, side, orderType, size}
+    어떤 경우에도 예외를 밖으로 던지지 않고 dict로 반환.
     """
-    secret = str(payload.get("secret", ""))
-    if secret != os.getenv("WEBHOOK_SECRET"):
+    # 1) 시크릿 체크
+    if str(payload.get("secret", "")) != WEBHOOK_SECRET:
         return {"ok": False, "reason": "bad secret"}
 
     raw_symbol = str(payload.get("symbol", ""))
-    side_raw = str(payload.get("side", "")).lower().strip()
-    side: Literal["buy", "sell"]
+    side_raw = str(payload.get("side", "")).lower()
     if side_raw not in ("buy", "sell"):
         return {"ok": False, "reason": f"bad side {side_raw}"}
-    side = "buy" if side_raw == "buy" else "sell"
-
-    symbol = normalize_symbol(raw_symbol)
+    side: Literal["buy", "sell"] = "buy" if side_raw == "buy" else "sell"
+    symbol = _normalize_symbol(raw_symbol)
 
     async with aiohttp.ClientSession() as session:
-        # 현재 포지션 & 의도 판정
-        cur_pos = await fetch_positions(session)
-        intent = decide_intent(cur_pos, symbol, side)
+        # 2) 현재 포지션 & 의도
+        current = await _fetch_positions(session)
+        intent = _decide_intent(current, symbol, side)
 
-        # MAX_COINS 제한 (진입만 막음, 물타기/종료는 허용)
+        # 3) MAX_COINS 제한: 신규 진입만 차단
         if intent == "entry":
-            if await count_distinct_symbols(session) >= MAX_COINS:
-                return {"ok": True, "skipped": "max_coins_reached"}
+            if len(current) >= MAX_COINS:
+                return {"ok": True, "skipped": "max_coins_reached", "intent": intent, "symbol": symbol}
+            if side == "sell" and not ALLOW_SHORTS:
+                return {"ok": True, "skipped": "shorts_disabled", "intent": intent, "symbol": symbol}
 
-            if REQUIRE_INTENT_FOR_OPEN and not ALLOW_SHORTS and side == "sell":
-                return {"ok": True, "skipped": "shorts_disabled"}
-
-        # 수량 계산
-        last_price = await fetch_last_price(session, symbol)
-        meta = await fetch_symbol_meta(session, symbol)
-        min_qty = meta["min_qty"]
-        qty_step = meta["qty_step"]
+        # 4) 수량 계산 (고정 마진: 6 USDT)
+        last_price = await _fetch_last_price(session, symbol)
+        meta = await _fetch_symbol_meta(session, symbol)
+        min_qty, qty_step = meta["min_qty"], meta["qty_step"]
 
         if FORCE_FIXED_SIZING:
-            lev = await get_symbol_leverage(session, symbol, default_leverage=10.0)
-            qty = compute_qty_from_margin(last_price, lev, FIXED_MARGIN_USD, min_qty, qty_step)
+            lev = await _get_user_leverage(session, symbol, default_lev=10.0)
+            qty = _qty_from_margin(last_price, lev, FIXED_MARGIN_USD, min_qty, qty_step)
         else:
-            # 백업 경로: TV가 보내는 size 사용 (하지만 기본은 고정마진 사용)
-            tv_size = float(payload.get("size") or 0)
-            qty = max(min_qty, round_step(float(tv_size), qty_step))
+            # fallback: TV에서 온 size 사용
+            try:
+                qty = float(payload.get("size") or 0.0)
+            except Exception:
+                qty = 0.0
+            qty = max(min_qty, _round_step(qty, qty_step))
 
         if qty <= 0:
-            return {"ok": False, "reason": "qty_zero"}
+            return {"ok": False, "reason": "qty_zero", "price": last_price}
 
+        # 5) 주문
         reduce_only = (intent == "exit")
-        res = await place_market_order(session, symbol, side, qty, reduce_only=reduce_only)
+        res = await _place_market(session, symbol, side, qty, reduce_only)
 
         return {
             "ok": True,
+            "intent": intent,
             "symbol": symbol,
             "side": side,
-            "intent": intent,
             "qty": qty,
             "price": last_price,
             "response": res,
