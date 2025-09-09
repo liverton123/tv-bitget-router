@@ -14,15 +14,16 @@ async def root():
 
 @app.post("/webhook")
 async def webhook(req: Request):
+    # 어떤 경우에도 500이 나가지 않도록 방어
     try:
         payload = await req.json()
-    except Exception:
-        return JSONResponse({"ok": False, "reason": "bad json"}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"ok": False, "reason": f"bad json: {type(e).__name__}"}, status_code=400)
 
     try:
         result = await handle_signal(payload)
-        status = 200 if result.get("ok") else 400
-        return JSONResponse(result, status_code=status)
+        # 내부에서 오류가 나도 여기서는 200/400으로만 응답하게
+        return JSONResponse(result, status_code=(200 if result.get("ok") else 400))
     except Exception as e:
-        # 안전 로그
-        return JSONResponse({"ok": False, "reason": f"exception: {type(e).__name__}"}, status_code=500)
+        # 최종 방어막
+        return JSONResponse({"ok": False, "reason": f"unhandled: {type(e).__name__}"}, status_code=400)
